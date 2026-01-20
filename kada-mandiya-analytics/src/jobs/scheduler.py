@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import sys
+import time
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from loguru import logger
+
+from src.config import load_settings
+from src.jobs.runner import run_pipeline_once
+
+logger.remove()
+logger.add(sys.stderr, level="INFO")
+
+
+def main() -> int:
+    settings = load_settings()
+
+    scheduler = BackgroundScheduler(
+        job_defaults={
+            "max_instances": settings.etl_max_instances,
+            "coalesce": settings.etl_coalesce,
+            "misfire_grace_time": settings.etl_misfire_grace_seconds,
+        }
+    )
+
+    interval_seconds = settings.etl_interval_seconds
+    scheduler.add_job(
+        run_pipeline_once, "interval", seconds=interval_seconds, id="silver_gold"
+    )
+
+    scheduler.start()
+    logger.info("Scheduler started: interval={}s", interval_seconds)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Scheduler stopping...")
+        scheduler.shutdown(wait=False)
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

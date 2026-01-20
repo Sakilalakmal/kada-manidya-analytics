@@ -23,6 +23,15 @@ class Settings(BaseModel):
     db_trust_cert: bool = Field(default=True, alias="DB_TRUST_CERT")
     analytics_api_key: SecretStr | None = Field(default=None, alias="ANALYTICS_API_KEY")
 
+    etl_interval_seconds: int = Field(default=120, alias="ETL_INTERVAL_SECONDS")
+    etl_enable_silver: bool = Field(default=True, alias="ETL_ENABLE_SILVER")
+    etl_enable_gold: bool = Field(default=True, alias="ETL_ENABLE_GOLD")
+    etl_max_instances: int = Field(default=1, alias="ETL_MAX_INSTANCES")
+    etl_coalesce: bool = Field(default=True, alias="ETL_COALESCE")
+    etl_misfire_grace_seconds: int = Field(
+        default=30, alias="ETL_MISFIRE_GRACE_SECONDS"
+    )
+
 
 def load_settings(env_path: Path | None = None) -> Settings:
     env_file = env_path or (project_root() / ".env")

@@ -47,6 +47,27 @@ python -m src.etl.03_build_silver
 python -m src.etl.04_build_gold
 ```
 
+## Run ETL Scheduler (APScheduler)
+
+Runs Silver then Gold on a timer with a SQL Server application lock (`sp_getapplock`) to prevent overlapping runs across processes.
+
+```powershell
+python -m src.jobs.scheduler
+```
+
+One-shot (debug):
+
+```powershell
+python -m src.jobs.runner --once
+```
+
+Schedule config (in `.env`):
+- `ETL_INTERVAL_SECONDS` (default `120`)
+- `ETL_ENABLE_SILVER` / `ETL_ENABLE_GOLD` (`yes`/`no`)
+- `ETL_MAX_INSTANCES` (default `1`)
+- `ETL_COALESCE` (`yes`/`no`)
+- `ETL_MISFIRE_GRACE_SECONDS` (default `30`)
+
 ## Run Dashboard
 
 ```powershell
