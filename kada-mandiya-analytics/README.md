@@ -1,0 +1,60 @@
+# Kada Mandiya Analytics (Phase 1)
+
+Warehouse foundation (Bronze/Silver/Gold/Ops) + ETL skeleton + Streamlit dashboard skeleton.
+
+## Setup (Windows PowerShell)
+
+```powershell
+cd analytics/kada-mandiya-analytics
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+copy .env.example .env
+notepad .env
+python src/scripts/test_db_connection.py
+```
+
+## Run Collector (FastAPI)
+
+- Writes validated events into Bronze tables (append-only) and sends invalid/unknown events to `ops.dead_letter_events`.
+- Auth: `X-ANALYTICS-KEY` header, configured via `ANALYTICS_API_KEY` in `.env`.
+
+```powershell
+uvicorn src.api.analytics_collector:app --host 127.0.0.1 --port 8000
+```
+
+Supported `event_type` values:
+- `page_view`, `click`, `scroll`, `form_interaction`, `search`
+- `performance`, `frontend_error`
+- `cart_action`, `checkout`, `purchase_view`
+- `api_request_log`, `db_query_perf`
+- Any other `event_type` is treated as a service/domain `BusinessEvent` and written to `bronze.business_events` (must include `service` and `payload`).
+
+Example (PowerShell):
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/events `
+  -H "Content-Type: application/json" `
+  -H "X-ANALYTICS-KEY: change-me" `
+  -d "{\"event_type\":\"page_view\",\"event_timestamp\":\"2026-01-20T00:00:00Z\",\"session_id\":\"s1\",\"user_id\":\"u1\",\"source\":\"web\",\"page_url\":\"/\",\"referrer_url\":null,\"properties\":{\"load_time_ms\":420}}"
+```
+
+## Run ETL
+
+```powershell
+python -m src.etl.01_create_warehouse
+python -m src.etl.02_seed_sample_events
+python -m src.etl.03_build_silver
+python -m src.etl.04_build_gold
+```
+
+## Run Dashboard
+
+```powershell
+streamlit run dashboards/app.py
+```
+
+## Notes
+
+- Login failures: check `DB_USER`/`DB_PASSWORD` and SQL Server authentication mode (Mixed Mode).
+- Network/port failures: ensure SQL Server is running, TCP/IP is enabled, and port `1433` is reachable.
+- Local dev TLS: uses ODBC Driver 18 with `Encrypt=yes` and `TrustServerCertificate=yes`.
