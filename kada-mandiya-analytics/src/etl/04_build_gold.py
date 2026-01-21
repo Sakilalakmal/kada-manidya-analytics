@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from sqlalchemy import text
 
 from src.config import load_settings
 from src.db.engine import get_engine
 from src.etl._ops import fail_run, finish_run, start_run
+from src.utils.time import utc_now
 
 
 def _exec(conn, sql: str) -> None:
     conn.execute(text(sql))
+
+
+def _safe_rowcount(result) -> int:
+    rc = getattr(result, "rowcount", 0)
+    try:
+        n = int(rc or 0)
+    except Exception:
+        n = 0
+    return n if n > 0 else 0
 
 
 def main() -> int:
@@ -18,6 +30,9 @@ def main() -> int:
     with engine.begin() as conn:
         run = start_run(conn, "build_gold")
         try:
+            since_date = (utc_now() - timedelta(days=30)).date()
+            rows_inserted = 0
+
             _exec(
                 conn,
                 """
@@ -62,13 +77,13 @@ def main() -> int:
                     UNION ALL
 
                     SELECT
-                        CAST(event_timestamp AS date) AS funnel_date,
+                        CAST(updated_at AS date) AS funnel_date,
                         'purchase' AS funnel_step,
                         4 AS step_order,
-                        COUNT(DISTINCT COALESCE(user_id, correlation_id)) AS users_count
-                    FROM bronze.business_events
-                    WHERE event_type = 'order_paid'
-                    GROUP BY CAST(event_timestamp AS date)
+                        COUNT(DISTINCT COALESCE(user_id, correlation_id, order_id)) AS users_count
+                    FROM silver.orders
+                    WHERE status = 'paid'
+                    GROUP BY CAST(updated_at AS date)
                 ),
                 with_drop AS (
                     SELECT
@@ -101,9 +116,16 @@ def main() -> int:
                 """,
             )
 
-            _exec(
-                conn,
-                """
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text("DELETE FROM gold.product_metrics WHERE metric_date >= :since_date;"),
+                    {"since_date": since_date},
+                )
+            )
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text(
+                        """
                 ;WITH interactions AS (
                     SELECT
                         CAST(event_timestamp AS date) AS metric_date,
@@ -112,27 +134,29 @@ def main() -> int:
                         SUM(CASE WHEN interaction_type = 'click' THEN 1 ELSE 0 END) AS clicks_count,
                         SUM(CASE WHEN interaction_type = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_cart_count
                     FROM silver.product_interactions
+                    WHERE event_timestamp >= :since_date
                     GROUP BY CAST(event_timestamp AS date), product_id
                 ),
                 purchases AS (
                     SELECT
-                        CAST(event_timestamp AS date) AS metric_date,
-                        JSON_VALUE(payload, '$.product_id') AS product_id,
-                        COUNT(*) AS purchases_count,
-                        SUM(TRY_CONVERT(decimal(12,2), JSON_VALUE(payload, '$.revenue'))) AS revenue
-                    FROM bronze.business_events
-                    WHERE event_type = 'order_paid'
-                    GROUP BY CAST(event_timestamp AS date), JSON_VALUE(payload, '$.product_id')
+                        CAST(o.updated_at AS date) AS metric_date,
+                        oi.product_id,
+                        SUM(oi.quantity) AS purchases_count,
+                        SUM(COALESCE(oi.line_total, oi.unit_price * oi.quantity, 0)) AS revenue
+                    FROM silver.order_items oi
+                    INNER JOIN silver.orders o ON oi.order_id = o.order_id
+                    WHERE o.status = 'paid' AND o.updated_at >= :since_date
+                    GROUP BY CAST(o.updated_at AS date), oi.product_id
                 ),
                 reviews AS (
                     SELECT
-                        CAST(event_timestamp AS date) AS metric_date,
-                        JSON_VALUE(payload, '$.product_id') AS product_id,
+                        CAST(created_at AS date) AS metric_date,
+                        product_id,
                         COUNT(*) AS reviews_count,
-                        AVG(TRY_CONVERT(decimal(3,2), JSON_VALUE(payload, '$.rating'))) AS avg_rating
-                    FROM bronze.business_events
-                    WHERE event_type = 'review_submitted'
-                    GROUP BY CAST(event_timestamp AS date), JSON_VALUE(payload, '$.product_id')
+                        AVG(CAST(rating AS decimal(3,2))) AS avg_rating
+                    FROM silver.reviews
+                    WHERE created_at >= :since_date
+                    GROUP BY CAST(created_at AS date), product_id
                 ),
                 keys AS (
                     SELECT metric_date, product_id FROM interactions
@@ -171,140 +195,113 @@ def main() -> int:
                         ON k.metric_date = r.metric_date AND k.product_id = r.product_id
                     WHERE k.product_id IS NOT NULL
                 )
-                MERGE gold.product_metrics AS tgt
-                USING merged AS src
-                ON tgt.product_id = src.product_id AND tgt.metric_date = src.metric_date
-                WHEN MATCHED THEN
-                    UPDATE SET
-                        tgt.views_count = src.views_count,
-                        tgt.clicks_count = src.clicks_count,
-                        tgt.add_to_cart_count = src.add_to_cart_count,
-                        tgt.purchases_count = src.purchases_count,
-                        tgt.revenue = src.revenue,
-                        tgt.avg_rating = src.avg_rating,
-                        tgt.reviews_count = src.reviews_count,
-                        tgt.view_to_cart_rate = src.view_to_cart_rate,
-                        tgt.cart_to_purchase_rate = src.cart_to_purchase_rate
-                WHEN NOT MATCHED THEN
-                    INSERT (
-                        product_id, metric_date, views_count, clicks_count, add_to_cart_count,
-                        purchases_count, revenue, avg_rating, reviews_count, view_to_cart_rate, cart_to_purchase_rate
-                    )
-                    VALUES (
-                        src.product_id, src.metric_date, src.views_count, src.clicks_count, src.add_to_cart_count,
-                        src.purchases_count, src.revenue, src.avg_rating, src.reviews_count,
-                        src.view_to_cart_rate, src.cart_to_purchase_rate
-                    );
-                """,
+                INSERT INTO gold.product_metrics (
+                    product_id, metric_date, views_count, clicks_count, add_to_cart_count,
+                    purchases_count, revenue, avg_rating, reviews_count, view_to_cart_rate, cart_to_purchase_rate
+                )
+                SELECT
+                    product_id, metric_date, views_count, clicks_count, add_to_cart_count,
+                    purchases_count, revenue, avg_rating, reviews_count, view_to_cart_rate, cart_to_purchase_rate
+                FROM merged
+                WHERE metric_date >= :since_date;
+                            """
+                    ),
+                    {"since_date": since_date},
+                )
             )
 
-            _exec(
-                conn,
-                """
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text("DELETE FROM gold.reviews_quality WHERE metric_date >= :since_date;"),
+                    {"since_date": since_date},
+                )
+            )
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text(
+                        """
                 ;WITH reviews AS (
                     SELECT
-                        CAST(event_timestamp AS date) AS metric_date,
-                        JSON_VALUE(payload, '$.product_id') AS product_id,
+                        CAST(created_at AS date) AS metric_date,
+                        product_id,
                         COUNT(*) AS total_reviews,
-                        SUM(CASE WHEN TRY_CONVERT(int, JSON_VALUE(payload, '$.rating')) = 5 THEN 1 ELSE 0 END)
-                            AS five_star_reviews,
-                        AVG(TRY_CONVERT(decimal(3,2), JSON_VALUE(payload, '$.rating'))) AS avg_rating
-                    FROM bronze.business_events
-                    WHERE event_type = 'review_submitted'
-                    GROUP BY CAST(event_timestamp AS date), JSON_VALUE(payload, '$.product_id')
+                        SUM(CASE WHEN rating = 5 THEN 1 ELSE 0 END) AS five_star_reviews,
+                        AVG(CAST(rating AS decimal(3,2))) AS avg_rating
+                    FROM silver.reviews
+                    WHERE created_at >= :since_date
+                    GROUP BY CAST(created_at AS date), product_id
                 )
-                MERGE gold.reviews_quality AS tgt
-                USING reviews AS src
-                ON tgt.metric_date = src.metric_date AND tgt.product_id = src.product_id
-                WHEN MATCHED THEN
-                    UPDATE SET
-                        tgt.total_reviews = src.total_reviews,
-                        tgt.five_star_reviews = src.five_star_reviews,
-                        tgt.avg_rating = src.avg_rating
-                WHEN NOT MATCHED THEN
-                    INSERT (metric_date, product_id, total_reviews, five_star_reviews, avg_rating)
-                    VALUES (src.metric_date, src.product_id, src.total_reviews, src.five_star_reviews, src.avg_rating);
-                """,
+                INSERT INTO gold.reviews_quality (metric_date, product_id, total_reviews, five_star_reviews, avg_rating)
+                SELECT metric_date, product_id, total_reviews, five_star_reviews, avg_rating
+                FROM reviews
+                WHERE metric_date >= :since_date;
+                            """
+                    ),
+                    {"since_date": since_date},
+                )
             )
 
-            _exec(
-                conn,
-                """
-                ;WITH created AS (
-                    SELECT CAST(event_timestamp AS date) AS metric_date,
-                           COUNT(DISTINCT entity_id) AS total_orders
-                    FROM bronze.business_events
-                    WHERE event_type = 'order_created'
-                    GROUP BY CAST(event_timestamp AS date)
-                ),
-                paid AS (
-                    SELECT CAST(event_timestamp AS date) AS metric_date,
-                           COUNT(DISTINCT entity_id) AS paid_orders,
-                           SUM(TRY_CONVERT(decimal(12,2), JSON_VALUE(payload, '$.revenue'))) AS total_revenue
-                    FROM bronze.business_events
-                    WHERE event_type = 'order_paid'
-                    GROUP BY CAST(event_timestamp AS date)
-                ),
-                cancelled AS (
-                    SELECT CAST(event_timestamp AS date) AS metric_date,
-                           COUNT(DISTINCT entity_id) AS cancelled_orders
-                    FROM bronze.business_events
-                    WHERE event_type = 'order_cancelled'
-                    GROUP BY CAST(event_timestamp AS date)
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text("DELETE FROM gold.orders_payments_daily WHERE metric_date >= :since_date;"),
+                    {"since_date": since_date},
+                )
+            )
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text(
+                        """
+                ;WITH orders_by_day AS (
+                    SELECT
+                        CAST(created_at AS date) AS metric_date,
+                        COUNT(*) AS total_orders,
+                        SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid_orders,
+                        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_orders,
+                        SUM(CASE WHEN status = 'paid' THEN ISNULL(total_amount, 0) ELSE 0 END) AS total_revenue
+                    FROM silver.orders
+                    WHERE created_at >= :since_date
+                    GROUP BY CAST(created_at AS date)
                 ),
                 refunds AS (
-                    SELECT CAST(event_timestamp AS date) AS metric_date,
-                           COUNT(*) AS refunds_count
-                    FROM bronze.business_events
-                    WHERE event_type = 'refund_issued'
-                    GROUP BY CAST(event_timestamp AS date)
+                    SELECT
+                        CAST(occurred_at AS date) AS metric_date,
+                        COUNT(*) AS refunds_count
+                    FROM silver.payments
+                    WHERE status = 'refunded' AND occurred_at >= :since_date
+                    GROUP BY CAST(occurred_at AS date)
                 ),
                 keys AS (
-                    SELECT metric_date FROM created
-                    UNION SELECT metric_date FROM paid
-                    UNION SELECT metric_date FROM cancelled
-                    UNION SELECT metric_date FROM refunds
+                    SELECT metric_date FROM orders_by_day
+                    UNION
+                    SELECT metric_date FROM refunds
                 ),
                 merged AS (
                     SELECT
                         k.metric_date,
-                        ISNULL(c.total_orders, 0) AS total_orders,
-                        ISNULL(p.paid_orders, 0) AS paid_orders,
-                        ISNULL(x.cancelled_orders, 0) AS cancelled_orders,
+                        ISNULL(o.total_orders, 0) AS total_orders,
+                        ISNULL(o.paid_orders, 0) AS paid_orders,
+                        ISNULL(o.cancelled_orders, 0) AS cancelled_orders,
                         CASE
-                            WHEN ISNULL(c.total_orders, 0) = 0 THEN NULL
-                            ELSE CAST(ISNULL(p.paid_orders, 0) AS decimal(10,4))
-                                / CAST(c.total_orders AS decimal(10,4))
+                            WHEN ISNULL(o.total_orders, 0) = 0 THEN NULL
+                            ELSE CAST(ISNULL(o.paid_orders, 0) AS decimal(10,4))
+                                / CAST(o.total_orders AS decimal(10,4))
                         END AS payment_success_rate,
-                        ISNULL(p.total_revenue, 0) AS total_revenue,
+                        ISNULL(o.total_revenue, 0) AS total_revenue,
                         ISNULL(r.refunds_count, 0) AS refunds_count
                     FROM keys k
-                    LEFT JOIN created c ON k.metric_date = c.metric_date
-                    LEFT JOIN paid p ON k.metric_date = p.metric_date
-                    LEFT JOIN cancelled x ON k.metric_date = x.metric_date
+                    LEFT JOIN orders_by_day o ON k.metric_date = o.metric_date
                     LEFT JOIN refunds r ON k.metric_date = r.metric_date
                 )
-                MERGE gold.orders_payments_daily AS tgt
-                USING merged AS src
-                ON tgt.metric_date = src.metric_date
-                WHEN MATCHED THEN
-                    UPDATE SET
-                        tgt.total_orders = src.total_orders,
-                        tgt.paid_orders = src.paid_orders,
-                        tgt.cancelled_orders = src.cancelled_orders,
-                        tgt.payment_success_rate = src.payment_success_rate,
-                        tgt.total_revenue = src.total_revenue,
-                        tgt.refunds_count = src.refunds_count
-                WHEN NOT MATCHED THEN
-                    INSERT (
-                        metric_date, total_orders, paid_orders, cancelled_orders,
-                        payment_success_rate, total_revenue, refunds_count
-                    )
-                    VALUES (
-                        src.metric_date, src.total_orders, src.paid_orders, src.cancelled_orders,
-                        src.payment_success_rate, src.total_revenue, src.refunds_count
-                    );
-                """,
+                INSERT INTO gold.orders_payments_daily
+                    (metric_date, total_orders, paid_orders, cancelled_orders, payment_success_rate, total_revenue, refunds_count)
+                SELECT
+                    metric_date, total_orders, paid_orders, cancelled_orders, payment_success_rate, total_revenue, refunds_count
+                FROM merged
+                WHERE metric_date >= :since_date;
+                            """
+                    ),
+                    {"since_date": since_date},
+                )
             )
 
             _exec(
@@ -530,20 +527,21 @@ def main() -> int:
                 ),
                 orders_today AS (
                     SELECT
-                        COUNT(DISTINCT entity_id) AS orders_today,
-                        SUM(TRY_CONVERT(decimal(12,2), JSON_VALUE(payload, '$.revenue'))) AS revenue_today
-                    FROM bronze.business_events be
+                        COUNT(*) AS orders_today,
+                        SUM(ISNULL(total_amount, 0)) AS revenue_today
+                    FROM silver.orders o
                     CROSS JOIN n
-                    WHERE be.event_type = 'order_paid' AND CAST(be.event_timestamp AS date) = n.today
+                    WHERE o.status = 'paid' AND CAST(o.updated_at AS date) = n.today
                 ),
                 top_product AS (
                     SELECT TOP 1
-                        JSON_VALUE(payload, '$.product_id') AS top_product_id
-                    FROM bronze.business_events be
+                        oi.product_id AS top_product_id
+                    FROM silver.order_items oi
+                    INNER JOIN silver.orders o ON oi.order_id = o.order_id
                     CROSS JOIN n
-                    WHERE be.event_type = 'order_paid' AND CAST(be.event_timestamp AS date) = n.today
-                    GROUP BY JSON_VALUE(payload, '$.product_id')
-                    ORDER BY SUM(TRY_CONVERT(decimal(12,2), JSON_VALUE(payload, '$.revenue'))) DESC
+                    WHERE o.status = 'paid' AND CAST(o.updated_at AS date) = n.today
+                    GROUP BY oi.product_id
+                    ORDER BY SUM(COALESCE(oi.line_total, oi.unit_price * oi.quantity, 0)) DESC
                 ),
                 top_page AS (
                     SELECT TOP 1 page_url AS top_page_url
@@ -606,7 +604,7 @@ def main() -> int:
                 """,
             )
 
-            finish_run(conn, run, rows_inserted=0)
+            finish_run(conn, run, rows_inserted=rows_inserted)
         except Exception as exc:
             fail_run(conn, run, str(exc))
             raise
