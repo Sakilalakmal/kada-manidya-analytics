@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -12,139 +11,367 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.config import load_settings  # noqa: E402
-from src.db.engine import get_engine  # noqa: E402
+from src.db.engine import get_engine as build_engine  # noqa: E402
 
 st.set_page_config(page_title="Kada Mandiya Analytics", layout="wide")
 
 
 @st.cache_resource
-def _engine():
+def get_engine():
     settings = load_settings()
-    return get_engine(settings)
+    return build_engine(settings)
 
 
-@st.cache_data(ttl=60)
-def _df(sql: str) -> pd.DataFrame:
-    return pd.read_sql(sql, _engine())
+@st.cache_data(ttl=60, show_spinner=False)
+def query_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    return pd.read_sql_query(sql, get_engine(), params=params)
+
+
+def _safe_df(
+    sql: str, params: dict | None = None, *, show_error: bool = True
+) -> pd.DataFrame:
+    try:
+        return query_df(sql, params=params)
+    except Exception as exc:
+        if show_error:
+            st.error(f"{exc}\n\nSQL:\n{sql}")
+        return pd.DataFrame()
 
 
 def _latest_date(table: str, date_col: str = "metric_date") -> str | None:
-    q = f"SELECT TOP 1 CAST({date_col} AS date) AS d FROM {table} ORDER BY {date_col} DESC;"
-    df = _df(q)
-    if df.empty:
-        return None
-    return str(df.loc[0, "d"])
+    df = _safe_df(
+        f"""
+        SELECT TOP 1 CAST({date_col} AS date) AS d
+        FROM {table}
+        WHERE {date_col} IS NOT NULL
+        ORDER BY {date_col} DESC;
+        """,
+        show_error=False,
+    )
+    return None if df.empty else str(df.loc[0, "d"])
+
+
+def _fmt_lkr(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    try:
+        v = float(value)
+    except Exception:
+        return "N/A"
+    return f"LKR {v:,.2f}"
+
+
+def _fmt_int(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    try:
+        return f"{int(value):,}"
+    except Exception:
+        return "N/A"
+
+
+def _fmt_pct(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    try:
+        v = float(value)
+    except Exception:
+        return "N/A"
+    if v > 1.0:
+        v = v / 100.0
+    return f"{v * 100:.1f}%"
 
 
 def executive():
     st.header("Executive")
-    rt = _df(
-        "SELECT TOP 1 * FROM gold.realtime_metrics ORDER BY metric_timestamp DESC;"
+
+    kpis = _safe_df(
+        """
+        SELECT
+            CAST(GETDATE() AS date) AS metric_date,
+            COUNT(1) AS rows_count,
+            SUM(CAST(total_revenue AS float)) AS total_revenue,
+            SUM(CAST(total_orders AS float)) AS total_orders,
+            SUM(CAST(cancelled_orders AS float)) AS cancelled_orders,
+            CASE
+                WHEN SUM(CAST(total_orders AS float)) = 0 THEN NULL
+                ELSE SUM(CAST(cancelled_orders AS float)) / NULLIF(SUM(CAST(total_orders AS float)), 0)
+            END AS cancel_rate,
+            CASE
+                WHEN COUNT(payment_success_rate) = 0 THEN NULL
+                ELSE AVG(CAST(payment_success_rate AS float))
+            END AS payment_success_rate
+        FROM gold.orders_payments_daily
+        WHERE CAST(metric_date AS date) = CAST(GETDATE() AS date);
+        """
     )
-    if rt.empty:
-        st.warning("No realtime metrics yet. Run the ETL first.")
+
+    if kpis.empty:
+        st.warning("No gold.orders_payments_daily data yet. Run the ETL first.")
         return
 
-    r = rt.iloc[0]
+    r = kpis.iloc[0].to_dict()
+    rows_count = int(r.get("rows_count") or 0)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Active Users (last 5m)", int(r["active_users_now"]))
-    c2.metric("Sessions Today", int(r["sessions_today"]))
-    c3.metric("Revenue Today", float(r["revenue_today"]))
-    c4.metric("Orders Today", int(r["orders_today"]))
+    c1.metric("Revenue Today", _fmt_lkr(r.get("total_revenue")))
+    c2.metric("Orders Today", _fmt_int(r.get("total_orders")))
+    c3.metric("Cancel Rate", _fmt_pct(r.get("cancel_rate")))
+    c4.metric("Payment Success Rate", _fmt_pct(r.get("payment_success_rate")))
+    if rows_count == 0:
+        st.info("No data available yet.")
+        latest = _latest_date("gold.orders_payments_daily", "metric_date")
+        if latest:
+            st.caption(f"Latest available date: {latest}")
 
-    trend = _df("""
-        SELECT TOP 30 metric_date, total_revenue
+    trend = _safe_df(
+        """
+        SELECT TOP 14
+            CAST(metric_date AS date) AS metric_date,
+            SUM(CAST(total_revenue AS float)) AS total_revenue
         FROM gold.orders_payments_daily
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(GETDATE() AS date))
+        GROUP BY CAST(metric_date AS date)
         ORDER BY metric_date DESC;
-        """).sort_values("metric_date")
-    if not trend.empty:
-        fig = px.line(
-            trend,
-            x="metric_date",
-            y="total_revenue",
-            title="Revenue Trend (Last 30 Days)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No orders_payments_daily data yet.")
-
-    latest = _latest_date("gold.conversion_funnel", "funnel_date")
-    if latest:
-        funnel = _df(f"""
-            SELECT funnel_step, step_order, users_count, drop_off_rate
-            FROM gold.conversion_funnel
-            WHERE funnel_date = '{latest}'
-            ORDER BY step_order;
-            """)
-        st.subheader(f"Conversion Funnel ({latest})")
-        st.dataframe(funnel, use_container_width=True, hide_index=True)
-    else:
-        st.info("No conversion_funnel data yet.")
+        """
+    )
+    st.subheader("Revenue Trend (Last 14 Days)")
+    if trend.empty:
+        st.info("No data available yet.")
+        latest = _latest_date("gold.orders_payments_daily", "metric_date")
+        if latest:
+            st.caption(f"Latest available date: {latest}")
+        return
+    trend = trend.sort_values("metric_date")
+    trend["metric_date"] = pd.to_datetime(trend["metric_date"])
+    st.line_chart(trend.set_index("metric_date")["total_revenue"])
 
 
 def product():
     st.header("Product")
-    latest = _latest_date("gold.product_metrics")
-    if not latest:
-        st.warning("No product metrics yet. Run the ETL first.")
-        return
+    st.caption("Top products are computed from the last 30 days of gold metrics.")
 
-    top = _df(f"""
-        SELECT TOP 10 product_id, revenue, purchases_count, add_to_cart_count, views_count
+    top_rev = _safe_df(
+        """
+        SELECT TOP 5
+            product_id,
+            SUM(CAST(revenue AS float)) AS revenue
         FROM gold.product_metrics
-        WHERE metric_date = '{latest}'
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(GETDATE() AS date))
+        GROUP BY product_id
         ORDER BY revenue DESC;
-        """)
-    c1, c2 = st.columns([2, 3])
+        """
+    )
+    top_purchases = _safe_df(
+        """
+        SELECT TOP 5
+            product_id,
+            SUM(CAST(purchases_count AS float)) AS purchases_count
+        FROM gold.product_metrics
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(GETDATE() AS date))
+        GROUP BY product_id
+        ORDER BY purchases_count DESC;
+        """
+    )
+
+    c1, c2 = st.columns(2)
     with c1:
-        st.subheader(f"Top Products by Revenue ({latest})")
-        st.dataframe(top, use_container_width=True, hide_index=True)
+        st.subheader("Top 5 Products by Revenue (30d)")
+        if top_rev.empty:
+            st.info("No data available yet.")
+            latest = _latest_date("gold.product_metrics", "metric_date")
+            if latest:
+                st.caption(f"Latest available date: {latest}")
+        else:
+            top_rev_display = top_rev.copy()
+            top_rev_display["revenue"] = top_rev_display["revenue"].map(_fmt_lkr)
+            st.dataframe(top_rev_display, use_container_width=True, hide_index=True)
+            chart = top_rev.set_index("product_id")["revenue"]
+            st.bar_chart(chart)
     with c2:
-        if not top.empty:
-            fig = px.bar(
-                top, x="product_id", y="revenue", title="Top Products (Revenue)"
+        st.subheader("Top 5 Products by Purchases (30d)")
+        if top_purchases.empty:
+            st.info("No data available yet.")
+            latest = _latest_date("gold.product_metrics", "metric_date")
+            if latest:
+                st.caption(f"Latest available date: {latest}")
+        else:
+            top_purchases_display = top_purchases.copy()
+            top_purchases_display["purchases_count"] = top_purchases_display[
+                "purchases_count"
+            ].map(_fmt_int)
+            st.dataframe(
+                top_purchases_display, use_container_width=True, hide_index=True
             )
-            st.plotly_chart(fig, use_container_width=True)
+            chart = top_purchases.set_index("product_id")["purchases_count"]
+            st.bar_chart(chart)
 
+    st.subheader("Avg Rating + Reviews per Product (30d)")
+    reviews = _safe_df(
+        """
+        SELECT
+            product_id,
+            AVG(CAST(avg_rating AS float)) AS avg_rating_30d,
+            SUM(CAST(total_reviews AS int)) AS total_reviews_30d,
+            SUM(CAST(five_star_reviews AS int)) AS five_star_reviews_30d
+        FROM gold.reviews_quality
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(GETDATE() AS date))
+        GROUP BY product_id
+        ORDER BY total_reviews_30d DESC;
+        """
+    )
+    if reviews.empty:
+        st.info("No data available yet.")
+        latest = _latest_date("gold.reviews_quality", "metric_date")
+        if latest:
+            st.caption(f"Latest available date: {latest}")
+    else:
+        reviews_display = reviews.copy()
+        reviews_display["avg_rating_30d"] = reviews_display["avg_rating_30d"].map(
+            lambda v: "N/A" if pd.isna(v) else f"{float(v):.2f}"
+        )
+        reviews_display["total_reviews_30d"] = reviews_display["total_reviews_30d"].map(
+            _fmt_int
+        )
+        reviews_display["five_star_reviews_30d"] = reviews_display[
+            "five_star_reviews_30d"
+        ].map(_fmt_int)
+        st.dataframe(reviews_display, use_container_width=True, hide_index=True)
 
-def behavior():
-    st.header("Behavior")
-    latest = _latest_date("gold.page_performance")
-    if not latest:
-        st.warning("No page performance yet. Run the ETL first.")
-        return
-
-    pages = _df(f"""
-        SELECT TOP 20 page_url, views, unique_visitors, avg_time_on_page_seconds, avg_scroll_depth, bounce_rate
-        FROM gold.page_performance
-        WHERE metric_date = '{latest}'
-        ORDER BY views DESC;
-        """)
-    st.subheader(f"Top Pages ({latest})")
-    st.dataframe(pages, use_container_width=True, hide_index=True)
+        top10 = reviews.head(10).copy()
+        if not top10.empty:
+            st.bar_chart(top10.set_index("product_id")["total_reviews_30d"])
 
 
 def ops():
     st.header("Ops")
-    latest = _latest_date("gold.system_health_daily")
-    if not latest:
-        st.warning("No system health yet. Run the ETL first.")
-        return
+    completed_runs = _safe_df(
+        """
+        SELECT TOP 10
+            run_type,
+            status,
+            started_at,
+            finished_at,
+            DATEDIFF(second, started_at, finished_at) AS duration_seconds,
+            rows_inserted,
+            error_message
+        FROM ops.etl_runs
+        WHERE finished_at IS NOT NULL
+        ORDER BY finished_at DESC;
+        """
+    )
+    running_runs = _safe_df(
+        """
+        SELECT TOP 10
+            run_type,
+            status,
+            started_at,
+            finished_at,
+            DATEDIFF(second, started_at, finished_at) AS duration_seconds,
+            rows_inserted,
+            error_message
+        FROM ops.etl_runs
+        WHERE finished_at IS NULL
+        ORDER BY started_at DESC;
+        """
+    )
 
-    health = _df(f"""
-        SELECT service, p50_latency_ms, p95_latency_ms, error_rate, dlq_count
+    runs = pd.concat([running_runs, completed_runs], ignore_index=True).head(10)
+    st.subheader("Recent ETL Runs (Last 10)")
+    if runs.empty:
+        st.info("No data available yet.")
+        latest = _latest_date("ops.etl_runs", "finished_at")
+        if latest:
+            st.caption(f"Latest available date: {latest}")
+    else:
+        runs_display = runs.copy()
+
+        def _normalize_status(status: str | None, finished_at) -> str:
+            if pd.isna(finished_at):
+                return "running"
+            v = (status or "").strip().lower()
+            if v in {"success", "succeeded", "ok", "passed", "completed"}:
+                return "success"
+            if v in {"failed", "fail", "error"}:
+                return "failed"
+            return v or "unknown"
+
+        runs_display["status_normalized"] = runs_display.apply(
+            lambda row: _normalize_status(row.get("status"), row.get("finished_at")),
+            axis=1,
+        )
+        runs_display["status_indicator"] = runs_display["status_normalized"].map(
+            lambda v: str(v).upper()
+        )
+        runs_display["duration"] = runs_display.apply(
+            lambda row: "running"
+            if pd.isna(row.get("finished_at"))
+            else ("N/A" if pd.isna(row.get("duration_seconds")) else f"{int(row.get('duration_seconds'))}s"),
+            axis=1,
+        )
+
+        cols = [
+            "run_type",
+            "status_indicator",
+            "started_at",
+            "finished_at",
+            "duration",
+            "rows_inserted",
+            "error_message",
+        ]
+        runs_display = runs_display[cols]
+
+        def _style_status(col: pd.Series) -> list[str]:
+            styles: list[str] = []
+            for v in col.astype(str):
+                val = v.lower()
+                if "success" in val:
+                    styles.append("color: #15803d; font-weight: 600;")
+                elif "failed" in val:
+                    styles.append("color: #b91c1c; font-weight: 600;")
+                elif "running" in val:
+                    styles.append("color: #a16207; font-weight: 600;")
+                else:
+                    styles.append("")
+            return styles
+
+        st.dataframe(
+            runs_display.style.apply(_style_status, subset=["status_indicator"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.subheader("System Health (If Available)")
+    health = _safe_df(
+        """
+        SELECT TOP 14
+            CAST(metric_date AS date) AS metric_date,
+            AVG(CAST(p95_latency_ms AS float)) AS p95_latency_ms,
+            AVG(CAST(error_rate AS float)) AS error_rate
         FROM gold.system_health_daily
-        WHERE metric_date = '{latest}'
-        ORDER BY service;
-        """)
-    st.subheader(f"System Health ({latest})")
-    st.dataframe(health, use_container_width=True, hide_index=True)
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(GETDATE() AS date))
+        GROUP BY CAST(metric_date AS date)
+        ORDER BY metric_date DESC;
+        """
+        ,
+        show_error=False,
+    )
+    if health.empty:
+        st.caption("gold.system_health_daily not available (or empty).")
+    else:
+        health = health.sort_values("metric_date")
+        health["metric_date"] = pd.to_datetime(health["metric_date"])
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("P95 latency (ms) - last 14 days")
+            st.line_chart(health.set_index("metric_date")["p95_latency_ms"])
+        with c2:
+            st.caption("Error rate - last 14 days")
+            st.line_chart(health.set_index("metric_date")["error_rate"])
 
 
 PAGES = {
     "Executive": executive,
     "Product": product,
-    "Behavior": behavior,
     "Ops": ops,
 }
 

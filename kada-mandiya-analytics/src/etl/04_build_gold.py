@@ -251,46 +251,63 @@ def main() -> int:
                 conn.execute(
                     text(
                         """
-                ;WITH orders_by_day AS (
+                ;WITH raw AS (
                     SELECT
-                        CAST(created_at AS date) AS metric_date,
-                        COUNT(*) AS total_orders,
-                        SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid_orders,
-                        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_orders,
-                        SUM(CASE WHEN status = 'paid' THEN ISNULL(total_amount, 0) ELSE 0 END) AS total_revenue
-                    FROM silver.orders
-                    WHERE created_at >= :since_date
-                    GROUP BY CAST(created_at AS date)
+                        CAST(event_timestamp AS date) AS metric_date,
+                        entity_id,
+                        LOWER(LTRIM(RTRIM(event_type))) AS raw_event_type,
+                        payload
+                    FROM bronze.business_events
+                    WHERE event_timestamp >= :since_date
                 ),
-                refunds AS (
+                normalized AS (
                     SELECT
-                        CAST(occurred_at AS date) AS metric_date,
-                        COUNT(*) AS refunds_count
-                    FROM silver.payments
-                    WHERE status = 'refunded' AND occurred_at >= :since_date
-                    GROUP BY CAST(occurred_at AS date)
+                        metric_date,
+                        entity_id,
+                        CASE
+                            WHEN raw_event_type IN ('order.created', 'order_created') THEN 'ORDER_CREATED'
+                            WHEN raw_event_type IN ('order_paid', 'order.paid', 'payment.succeeded', 'payment.success', 'payment_success') THEN 'ORDER_PAID'
+                            WHEN raw_event_type IN ('order.cancelled', 'order_cancelled') THEN 'ORDER_CANCELLED'
+                            WHEN raw_event_type IN ('review_submitted', 'review.submitted') THEN 'REVIEW_SUBMITTED'
+                            ELSE NULL
+                        END AS normalized_type,
+                        TRY_CONVERT(
+                            decimal(12,2),
+                            COALESCE(
+                                JSON_VALUE(payload, '$.total_amount'),
+                                JSON_VALUE(payload, '$.data.total_amount'),
+                                JSON_VALUE(payload, '$.order.total_amount'),
+                                JSON_VALUE(payload, '$.amount'),
+                                JSON_VALUE(payload, '$.data.amount')
+                            )
+                        ) AS total_amount
+                    FROM raw
                 ),
-                keys AS (
-                    SELECT metric_date FROM orders_by_day
-                    UNION
-                    SELECT metric_date FROM refunds
+                orders_by_day AS (
+                    SELECT
+                        metric_date,
+                        COUNT(DISTINCT CASE WHEN normalized_type = 'ORDER_CREATED' THEN entity_id END) AS total_orders,
+                        COUNT(DISTINCT CASE WHEN normalized_type = 'ORDER_PAID' THEN entity_id END) AS paid_orders,
+                        COUNT(DISTINCT CASE WHEN normalized_type = 'ORDER_CANCELLED' THEN entity_id END) AS cancelled_orders,
+                        SUM(CASE WHEN normalized_type = 'ORDER_PAID' THEN ISNULL(total_amount, 0) ELSE 0 END) AS total_revenue
+                    FROM normalized
+                    WHERE normalized_type IN ('ORDER_CREATED', 'ORDER_PAID', 'ORDER_CANCELLED')
+                    GROUP BY metric_date
                 ),
                 merged AS (
                     SELECT
-                        k.metric_date,
-                        ISNULL(o.total_orders, 0) AS total_orders,
-                        ISNULL(o.paid_orders, 0) AS paid_orders,
-                        ISNULL(o.cancelled_orders, 0) AS cancelled_orders,
+                        metric_date,
+                        ISNULL(total_orders, 0) AS total_orders,
+                        ISNULL(paid_orders, 0) AS paid_orders,
+                        ISNULL(cancelled_orders, 0) AS cancelled_orders,
                         CASE
-                            WHEN ISNULL(o.total_orders, 0) = 0 THEN NULL
-                            ELSE CAST(ISNULL(o.paid_orders, 0) AS decimal(10,4))
-                                / CAST(o.total_orders AS decimal(10,4))
+                            WHEN ISNULL(total_orders, 0) > 0
+                                THEN CAST(ISNULL(paid_orders, 0) AS decimal(10,4)) / CAST(total_orders AS decimal(10,4))
+                            ELSE CAST(0 AS decimal(10,4))
                         END AS payment_success_rate,
-                        ISNULL(o.total_revenue, 0) AS total_revenue,
-                        ISNULL(r.refunds_count, 0) AS refunds_count
-                    FROM keys k
-                    LEFT JOIN orders_by_day o ON k.metric_date = o.metric_date
-                    LEFT JOIN refunds r ON k.metric_date = r.metric_date
+                        ISNULL(total_revenue, 0) AS total_revenue,
+                        CAST(0 AS int) AS refunds_count
+                    FROM orders_by_day
                 )
                 INSERT INTO gold.orders_payments_daily
                     (metric_date, total_orders, paid_orders, cancelled_orders, payment_success_rate, total_revenue, refunds_count)
