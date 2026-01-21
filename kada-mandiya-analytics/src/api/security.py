@@ -21,7 +21,8 @@ def require_api_key(
     expected = _expected_key()
     if not expected:
         raise HTTPException(
-            status_code=503, detail="Server misconfigured: ANALYTICS_API_KEY missing"
+            status_code=503,
+            detail="Server misconfigured: ANALYTICS_API_KEY missing",
         )
     if x_analytics_key != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
