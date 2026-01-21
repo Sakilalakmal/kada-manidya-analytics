@@ -186,6 +186,73 @@ def main() -> int:
             );
         END
         """)
+
+    # SILVER business canonical tables
+    statements.append("""
+        IF OBJECT_ID('silver.orders', 'U') IS NULL
+        BEGIN
+            CREATE TABLE silver.orders(
+                order_id varchar(64) NOT NULL
+                    CONSTRAINT PK_silver_orders PRIMARY KEY,
+                user_id varchar(64) NULL,
+                created_at datetime2 NOT NULL,
+                status varchar(32) NOT NULL,
+                currency varchar(10) NULL,
+                total_amount decimal(12,2) NULL,
+                correlation_id varchar(64) NULL,
+                source_service varchar(64) NULL,
+                updated_at datetime2 NOT NULL
+            );
+        END
+        """)
+    statements.append("""
+        IF OBJECT_ID('silver.order_items', 'U') IS NULL
+        BEGIN
+            CREATE TABLE silver.order_items(
+                order_item_id uniqueidentifier NOT NULL
+                    CONSTRAINT DF_silver_order_items_order_item_id DEFAULT NEWID()
+                    CONSTRAINT PK_silver_order_items PRIMARY KEY,
+                order_id varchar(64) NOT NULL,
+                product_id varchar(64) NOT NULL,
+                quantity int NOT NULL,
+                unit_price decimal(12,2) NULL,
+                line_total decimal(12,2) NULL
+            );
+        END
+        """)
+    statements.append("""
+        IF OBJECT_ID('silver.payments', 'U') IS NULL
+        BEGIN
+            CREATE TABLE silver.payments(
+                payment_id varchar(64) NOT NULL
+                    CONSTRAINT PK_silver_payments PRIMARY KEY,
+                order_id varchar(64) NULL,
+                user_id varchar(64) NULL,
+                status varchar(32) NOT NULL,
+                amount decimal(12,2) NULL,
+                currency varchar(10) NULL,
+                provider varchar(50) NULL,
+                occurred_at datetime2 NOT NULL,
+                correlation_id varchar(64) NULL,
+                source_service varchar(64) NULL
+            );
+        END
+        """)
+    statements.append("""
+        IF OBJECT_ID('silver.reviews', 'U') IS NULL
+        BEGIN
+            CREATE TABLE silver.reviews(
+                review_id varchar(64) NOT NULL
+                    CONSTRAINT PK_silver_reviews PRIMARY KEY,
+                product_id varchar(64) NOT NULL,
+                user_id varchar(64) NULL,
+                rating int NOT NULL,
+                comment nvarchar(1000) NULL,
+                created_at datetime2 NOT NULL,
+                correlation_id varchar(64) NULL
+            );
+        END
+        """)
     statements.append("""
         IF OBJECT_ID('bronze.api_request_logs', 'U') IS NULL
         BEGIN
@@ -425,6 +492,12 @@ def main() -> int:
         "IX_bronze_business_events_service_type_ts",
         "service, event_type, event_timestamp",
     )
+
+    ix("silver.orders", "IX_silver_orders_status_created_at", "status, created_at")
+    ix("silver.order_items", "IX_silver_order_items_order_id", "order_id")
+    ix("silver.order_items", "IX_silver_order_items_product_id", "product_id")
+    ix("silver.payments", "IX_silver_payments_status_occurred_at", "status, occurred_at")
+    ix("silver.reviews", "IX_silver_reviews_product_id_created_at", "product_id, created_at")
 
     ix("bronze.api_request_logs", "IX_bronze_api_request_logs_timestamp", "[timestamp]")
     ix(
