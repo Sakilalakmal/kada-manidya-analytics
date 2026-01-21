@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import sys
 
 from loguru import logger
@@ -12,6 +11,7 @@ from src.config import load_settings
 from src.db.engine import get_engine
 from src.jobs.locking import LockNotAcquired, db_lock
 from src.jobs.ops_logger import finish_job_run, start_job_run
+from src.jobs.pipeline import run_pipeline
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
@@ -20,48 +20,37 @@ logger.add(sys.stderr, level="INFO")
 TRANSIENT_DB_EXC = (OperationalError, DBAPIError)
 
 
-def _call_etl_main(module_name: str) -> None:
-    mod = importlib.import_module(module_name)
-    main = getattr(mod, "main", None)
-    if not callable(main):
-        raise RuntimeError(f"{module_name}.main() not found")
-    rc = int(main())
-    if rc != 0:
-        raise RuntimeError(f"{module_name}.main() returned {rc}")
-
-
 @retry(
     retry=retry_if_exception_type(TRANSIENT_DB_EXC),
     stop=stop_after_attempt(3),
     wait=wait_fixed(2),
     reraise=True,
 )
-def _run_stage(stage: str) -> None:
-    if stage == "silver":
-        _call_etl_main("src.etl.03_build_silver")
-        return
-    if stage == "gold":
-        _call_etl_main("src.etl.04_build_gold")
-        return
-    raise ValueError(f"unknown stage: {stage}")
+def _run_pipeline(include_seed: bool) -> None:
+    run_pipeline(include_seed=include_seed)
 
 
-def run_pipeline_once() -> dict[str, str]:
+def run_pipeline_once(*, include_seed: bool = True) -> dict[str, str]:
     settings = load_settings()
     engine = get_engine(settings)
 
     enable_silver = bool(getattr(settings, "etl_enable_silver", True))
     enable_gold = bool(getattr(settings, "etl_enable_gold", True))
 
-    if not enable_silver and not enable_gold:
-        logger.info("ETL disabled (ETL_ENABLE_SILVER=no and ETL_ENABLE_GOLD=no).")
+    if not include_seed and not enable_silver and not enable_gold:
+        logger.info(
+            "Pipeline skipped (ETL_ENABLE_SILVER=no and ETL_ENABLE_GOLD=no and --no-seed)."
+        )
         return {"status": "skipped"}
 
-    run_type = (
-        "silver+gold"
-        if enable_silver and enable_gold
-        else ("silver" if enable_silver else "gold")
-    )
+    parts: list[str] = []
+    if include_seed:
+        parts.append("seed")
+    if enable_silver:
+        parts.append("silver")
+    if enable_gold:
+        parts.append("gold")
+    run_type = "+".join(parts) if parts else "pipeline"
 
     with engine.connect() as conn:
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -73,17 +62,7 @@ def run_pipeline_once() -> dict[str, str]:
                     logger.error("Failed to start ops.etl_runs row: {}", exc)
                     return {"status": "failed"}
                 try:
-                    if enable_silver:
-                        logger.info("Running silver...")
-                        _run_stage("silver")
-                    else:
-                        logger.info("Skipping silver (ETL_ENABLE_SILVER=no).")
-
-                    if enable_gold:
-                        logger.info("Running gold...")
-                        _run_stage("gold")
-                    else:
-                        logger.info("Skipping gold (ETL_ENABLE_GOLD=no).")
+                    _run_pipeline(include_seed=include_seed)
 
                     finish_job_run(conn, run, status="success", error_message=None)
                     return {"status": "success"}
@@ -98,18 +77,21 @@ def run_pipeline_once() -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run analytics ETL pipeline (silver + gold)."
+        description="Run analytics ETL pipeline (seed -> silver -> gold)."
     )
     parser.add_argument(
         "--once", action="store_true", help="Run a single cycle and exit."
     )
+    parser.add_argument(
+        "--no-seed", action="store_true", help="Skip the seed step (DEV-only)."
+    )
     args = parser.parse_args()
 
     if args.once:
-        result = run_pipeline_once()
+        result = run_pipeline_once(include_seed=not args.no_seed)
         return 0 if result["status"] in {"success", "skipped"} else 1
 
-    result = run_pipeline_once()
+    result = run_pipeline_once(include_seed=not args.no_seed)
     return 0 if result["status"] in {"success", "skipped"} else 1
 
 

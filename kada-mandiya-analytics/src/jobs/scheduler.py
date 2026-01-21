@@ -7,10 +7,29 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
 
 from src.config import load_settings
-from src.jobs.runner import run_pipeline_once
+from src.db.engine import get_engine
+from src.jobs.locking import LockNotAcquired, db_lock
+from src.jobs.pipeline import run_pipeline
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
+
+PIPELINE_INTERVAL_SECONDS = 300
+
+
+def _run_pipeline_job() -> None:
+    settings = load_settings()
+    engine = get_engine(settings)
+
+    with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        try:
+            with db_lock(conn):
+                run_pipeline(include_seed=False)
+        except LockNotAcquired:
+            logger.info("Another ETL run is in progress; skipping.")
+        except Exception:
+            logger.exception("Scheduled pipeline failed")
 
 
 def main() -> int:
@@ -24,13 +43,15 @@ def main() -> int:
         }
     )
 
-    interval_seconds = settings.etl_interval_seconds
     scheduler.add_job(
-        run_pipeline_once, "interval", seconds=interval_seconds, id="silver_gold"
+        _run_pipeline_job,
+        "interval",
+        seconds=PIPELINE_INTERVAL_SECONDS,
+        id="pipeline_no_seed",
     )
 
     scheduler.start()
-    logger.info("Scheduler started: interval={}s", interval_seconds)
+    logger.info("Scheduler started: interval={}s", PIPELINE_INTERVAL_SECONDS)
 
     try:
         while True:
