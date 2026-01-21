@@ -25,7 +25,7 @@ def _run_pipeline_job() -> None:
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         try:
             with db_lock(conn):
-                run_pipeline(include_seed=False)
+                run_pipeline(run_type="pipeline_scheduled", include_seed=False)
         except LockNotAcquired:
             logger.info("Another ETL run is in progress; skipping.")
         except Exception:
