@@ -10,7 +10,6 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fi
 from src.config import load_settings
 from src.db.engine import get_engine
 from src.jobs.locking import LockNotAcquired, db_lock
-from src.jobs.ops_logger import finish_job_run, start_job_run
 from src.jobs.pipeline import run_pipeline
 
 logger.remove()
@@ -27,7 +26,7 @@ TRANSIENT_DB_EXC = (OperationalError, DBAPIError)
     reraise=True,
 )
 def _run_pipeline(include_seed: bool) -> None:
-    run_pipeline(include_seed=include_seed)
+    run_pipeline(run_type="pipeline_once", include_seed=include_seed)
 
 
 def run_pipeline_once(*, include_seed: bool = True) -> dict[str, str]:
@@ -50,29 +49,21 @@ def run_pipeline_once(*, include_seed: bool = True) -> dict[str, str]:
         parts.append("silver")
     if enable_gold:
         parts.append("gold")
-    run_type = "+".join(parts) if parts else "pipeline"
+    run_label = "+".join(parts) if parts else "pipeline"
 
     with engine.connect() as conn:
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         try:
             with db_lock(conn):
                 try:
-                    run = start_job_run(conn, run_type)
-                except Exception as exc:
-                    logger.error("Failed to start ops.etl_runs row: {}", exc)
-                    return {"status": "failed"}
-                try:
                     _run_pipeline(include_seed=include_seed)
-
-                    finish_job_run(conn, run, status="success", error_message=None)
                     return {"status": "success"}
                 except Exception as exc:
-                    finish_job_run(conn, run, status="failed", error_message=str(exc))
                     logger.error("ETL failed: {}", exc)
-                    return {"status": "failed"}
+                    return {"status": "failed", "error": str(exc), "run": run_label}
         except LockNotAcquired:
             logger.info("Another ETL run is in progress; skipping.")
-            return {"status": "skipped"}
+            return {"status": "skipped", "run": run_label}
 
 
 def main() -> int:
