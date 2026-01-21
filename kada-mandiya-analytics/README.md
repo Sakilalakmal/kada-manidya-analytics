@@ -38,6 +38,42 @@ curl.exe -X POST http://127.0.0.1:8000/events `
   -d "{\"event_type\":\"page_view\",\"event_timestamp\":\"2026-01-20T00:00:00Z\",\"session_id\":\"s1\",\"user_id\":\"u1\",\"source\":\"web\",\"page_url\":\"/\",\"referrer_url\":null,\"properties\":{\"load_time_ms\":420}}"
 ```
 
+## Run RabbitMQ -> Analytics Consumer
+
+Durable RabbitMQ topic consumer that ingests service/domain messages into `bronze.business_events` (append-only).
+
+- Exchange (default): `domain.events` (topic)
+- Routing keys (default): `order.*`, `payment.*`, `review.*`
+- Idempotency: computes a deterministic SHA-256 fingerprint and claims it in `ops.event_fingerprints` (auto-created if missing). Duplicates are ACKed and skipped.
+- Failures: invalid JSON or DB failures after retries are written to `ops.dead_letter_events` and ACKed (analytics is not source of truth).
+
+Start consumer (PowerShell):
+
+```powershell
+cd analytics/kada-mandiya-analytics
+venv\Scripts\activate
+python -m src.scripts.run_consumer
+```
+
+Consumer env vars (in `.env`):
+
+- `ANALYTICS_CONSUMER_ENABLED` (`yes`/`no`)
+- `RABBITMQ_URL` (e.g. `amqp://guest:guest@localhost:5672/`)
+- `RABBITMQ_EXCHANGE` (default `domain.events`)
+- `RABBITMQ_EXCHANGE_TYPE` (default `topic`)
+- `RABBITMQ_QUEUE` (default `analytics.business.events`)
+- `RABBITMQ_ROUTING_KEYS` (CSV, default `order.*,payment.*,review.*`)
+- `RABBITMQ_PREFETCH` (default `50`)
+- `RABBITMQ_DLQ` (optional; if set, consumer declares a local DLX `analytics.dlx` and routes rejected messages)
+
+Verify ingestion (SQL Server):
+
+```sql
+SELECT TOP 20 *
+FROM bronze.business_events
+ORDER BY event_timestamp DESC;
+```
+
 ## Run ETL
 
 ```powershell

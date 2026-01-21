@@ -23,6 +23,23 @@ class Settings(BaseModel):
     db_trust_cert: bool = Field(default=True, alias="DB_TRUST_CERT")
     analytics_api_key: SecretStr | None = Field(default=None, alias="ANALYTICS_API_KEY")
 
+    rabbitmq_url: str = Field(
+        default="amqp://guest:guest@localhost:5672/", alias="RABBITMQ_URL"
+    )
+    rabbitmq_exchange: str = Field(default="domain.events", alias="RABBITMQ_EXCHANGE")
+    rabbitmq_exchange_type: str = Field(default="topic", alias="RABBITMQ_EXCHANGE_TYPE")
+    rabbitmq_queue: str = Field(
+        default="analytics.business.events", alias="RABBITMQ_QUEUE"
+    )
+    rabbitmq_routing_keys: str = Field(
+        default="order.*,payment.*,review.*", alias="RABBITMQ_ROUTING_KEYS"
+    )
+    rabbitmq_prefetch: int = Field(default=50, alias="RABBITMQ_PREFETCH")
+    rabbitmq_dlq: str | None = Field(default=None, alias="RABBITMQ_DLQ")
+    analytics_consumer_enabled: bool = Field(
+        default=False, alias="ANALYTICS_CONSUMER_ENABLED"
+    )
+
     etl_interval_seconds: int = Field(default=120, alias="ETL_INTERVAL_SECONDS")
     etl_enable_silver: bool = Field(default=True, alias="ETL_ENABLE_SILVER")
     etl_enable_gold: bool = Field(default=True, alias="ETL_ENABLE_GOLD")
