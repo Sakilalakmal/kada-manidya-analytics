@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import datetime, timedelta
 
 from sqlalchemy import text
@@ -28,12 +29,21 @@ from src.etl.utils_business_events import (
 from src.utils.time import to_sqlserver_utc_naive, utc_now
 
 
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 365) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None and str(raw).strip() else int(default)
+    except Exception:
+        value = int(default)
+    return max(min_value, min(max_value, value))
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build Silver layer from Bronze events")
     p.add_argument(
         "--days",
         type=int,
-        default=30,
+        default=_env_int("ETL_RECENT_DAYS", 30),
         help="Recompute window (days) for business events (default: 30)",
     )
     return p.parse_args()
@@ -129,7 +139,7 @@ def build_silver_web_events(conn) -> int:
 
     max_ts = conn.execute(text("SELECT MAX(event_timestamp) FROM silver.web_events;")).scalar()
     if max_ts is None:
-        since_ts = to_sqlserver_utc_naive(utc_now() - timedelta(days=30))
+        since_ts = to_sqlserver_utc_naive(utc_now() - timedelta(days=_env_int("ETL_RECENT_DAYS", 30)))
     else:
         since_ts = max_ts - timedelta(minutes=2)
 
@@ -267,6 +277,8 @@ def build_silver_web_events(conn) -> int:
                     WHEN COALESCE(JSON_VALUE(ce.properties, '$.interaction_type'), '') = 'add_to_cart' THEN 'add_to_cart'
                     WHEN ce.element_id = 'btn_checkout' THEN 'begin_checkout'
                     WHEN COALESCE(JSON_VALUE(ce.properties, '$.interaction_type'), '') IN ('checkout_started', 'begin_checkout') THEN 'begin_checkout'
+                    WHEN ce.element_id = 'purchase_completed' THEN 'purchase'
+                    WHEN COALESCE(JSON_VALUE(ce.properties, '$.interaction_type'), '') IN ('purchase_completed', 'purchase') THEN 'purchase'
                     ELSE 'click'
                 END AS event_type,
                 ce.page_url,
@@ -383,7 +395,7 @@ def build_silver_web_events(conn) -> int:
 def build_silver_purchases(conn) -> int:
     _ensure_behavior_tables(conn)
 
-    since_ts = to_sqlserver_utc_naive(utc_now() - timedelta(days=30))
+    since_ts = to_sqlserver_utc_naive(utc_now() - timedelta(days=_env_int("ETL_RECENT_DAYS", 30)))
     res = conn.execute(
         text(
             """
@@ -468,7 +480,8 @@ def main() -> int:
     settings = load_settings()
     engine = get_engine(settings)
 
-    since_interactions = to_sqlserver_utc_naive(utc_now() - timedelta(days=7))
+    recent_days = _env_int("ETL_RECENT_DAYS", 30)
+    since_interactions = to_sqlserver_utc_naive(utc_now() - timedelta(days=min(7, recent_days)))
 
     with engine.begin() as conn:
         run = start_run(conn, "build_silver")

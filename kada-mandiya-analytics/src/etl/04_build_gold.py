@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 
 from sqlalchemy import text
@@ -92,6 +93,15 @@ def _safe_rowcount(result) -> int:
     return n if n > 0 else 0
 
 
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 365) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None and str(raw).strip() else int(default)
+    except Exception:
+        value = int(default)
+    return max(min_value, min(max_value, value))
+
+
 def main() -> int:
     settings = load_settings()
     engine = get_engine(settings)
@@ -100,7 +110,8 @@ def main() -> int:
     with engine.begin() as conn:
         run = start_run(conn, "build_gold")
         try:
-            since_date = (utc_now() - timedelta(days=30)).date()
+            recent_days = _env_int("ETL_RECENT_DAYS", 30)
+            since_date = (utc_now() - timedelta(days=recent_days)).date()
             rows_inserted = 0
 
             _ensure_behavior_gold_tables(conn)
@@ -301,12 +312,18 @@ def main() -> int:
                         ),
                         p AS (
                             SELECT
-                                event_date AS metric_date,
-                                COUNT(DISTINCT order_id) AS purchases
-                            FROM silver.purchases
+                                CAST(event_timestamp AS date) AS metric_date,
+                                COUNT(
+                                    DISTINCT COALESCE(
+                                        CONCAT('o:', JSON_VALUE(properties_json, '$.order_id')),
+                                        CONCAT('s:', session_id)
+                                    )
+                                ) AS purchases
+                            FROM silver.web_events
                             WHERE event_timestamp >= :since_date
-                              AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = silver.purchases.order_id))
-                            GROUP BY event_date
+                              AND event_type = 'purchase'
+                              AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
+                            GROUP BY CAST(event_timestamp AS date)
                         ),
                         merged AS (
                             SELECT
@@ -344,25 +361,14 @@ def main() -> int:
                 conn.execute(
                     text(
                         """
-                        ;WITH seed_orders AS (
-                            SELECT DISTINCT
-                                COALESCE(
-                                    be.entity_id,
-                                    JSON_VALUE(be.payload, '$.order_id'),
-                                    JSON_VALUE(be.payload, '$.data.order_id'),
-                                    JSON_VALUE(be.payload, '$.order.order_id')
-                                ) AS order_id
-                            FROM bronze.business_events be
-                            WHERE be.event_timestamp >= :since_date
-                              AND be.payload LIKE '%seed_run_id%'
-                        ),
-                        session_flags AS (
+                        ;WITH session_flags AS (
                             SELECT
                                 CAST(event_timestamp AS date) AS metric_date,
                                 session_id,
                                 MAX(CASE WHEN event_type = 'page_view' AND product_id IS NOT NULL THEN 1 ELSE 0 END) AS has_view,
                                 MAX(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS has_cart,
-                                MAX(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS has_checkout
+                                MAX(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS has_checkout,
+                                MAX(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) AS has_purchase
                             FROM silver.web_events
                             WHERE event_timestamp >= :since_date
                               AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
@@ -373,77 +379,10 @@ def main() -> int:
                                 metric_date,
                                 COUNT(DISTINCT CASE WHEN has_view = 1 THEN session_id END) AS view_sessions,
                                 COUNT(DISTINCT CASE WHEN has_cart = 1 THEN session_id END) AS cart_sessions,
-                                COUNT(DISTINCT CASE WHEN has_checkout = 1 THEN session_id END) AS checkout_sessions
+                                COUNT(DISTINCT CASE WHEN has_checkout = 1 THEN session_id END) AS checkout_sessions,
+                                COUNT(DISTINCT CASE WHEN has_purchase = 1 THEN session_id END) AS purchase_sessions
                             FROM session_flags
                             GROUP BY metric_date
-                        ),
-                        session_start AS (
-                            SELECT
-                                CAST(event_timestamp AS date) AS metric_date,
-                                session_id,
-                                MAX(user_id) AS user_id,
-                                MIN(event_timestamp) AS session_start_ts
-                            FROM silver.web_events
-                            WHERE event_timestamp >= :since_date
-                              AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
-                            GROUP BY CAST(event_timestamp AS date), session_id
-                        ),
-                        purchase_base AS (
-                            SELECT
-                                event_timestamp,
-                                event_date AS metric_date,
-                                order_id,
-                                user_id,
-                                correlation_id
-                            FROM silver.purchases
-                            WHERE event_timestamp >= :since_date
-                              AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = silver.purchases.order_id))
-                        ),
-                        purchase_mapped AS (
-                            SELECT
-                                p.metric_date,
-                                p.order_id,
-                                p.user_id,
-                                COALESCE(sid.session_id, suser.session_id) AS mapped_session_id
-                            FROM purchase_base p
-                            OUTER APPLY (
-                                SELECT TOP 1 s.session_id
-                                FROM session_start s
-                                WHERE s.metric_date = p.metric_date
-                                  AND p.correlation_id IS NOT NULL
-                                  AND s.session_id = p.correlation_id
-                            ) sid
-                            OUTER APPLY (
-                                SELECT TOP 1 s.session_id
-                                FROM session_start s
-                                WHERE s.metric_date = p.metric_date
-                                  AND sid.session_id IS NULL
-                                  AND p.user_id IS NOT NULL
-                                  AND s.user_id = p.user_id
-                                ORDER BY ABS(DATEDIFF(SECOND, s.session_start_ts, p.event_timestamp))
-                            ) suser
-                        ),
-                        purchase_session_counts AS (
-                            SELECT
-                                metric_date,
-                                COUNT(DISTINCT mapped_session_id) AS purchase_sessions_assigned,
-                                COUNT(DISTINCT CASE WHEN user_id IS NULL THEN NULL ELSE user_id END) AS purchase_users
-                            FROM purchase_mapped
-                            GROUP BY metric_date
-                        ),
-                        merged AS (
-                            SELECT
-                                COALESCE(sc.metric_date, psc.metric_date) AS metric_date,
-                                ISNULL(sc.view_sessions, 0) AS view_sessions,
-                                ISNULL(sc.cart_sessions, 0) AS cart_sessions,
-                                ISNULL(sc.checkout_sessions, 0) AS checkout_sessions,
-                                CASE
-                                    WHEN ISNULL(psc.purchase_sessions_assigned, 0) > 0 THEN ISNULL(psc.purchase_sessions_assigned, 0)
-                                    ELSE ISNULL(psc.purchase_users, 0)
-                                END AS purchase_sessions
-                            FROM session_counts sc
-                            FULL OUTER JOIN purchase_session_counts psc
-                                ON sc.metric_date = psc.metric_date
                         ),
                         with_rates AS (
                             SELECT
@@ -456,7 +395,7 @@ def main() -> int:
                                 CASE WHEN cart_sessions = 0 THEN 0.0 ELSE CAST(checkout_sessions AS float) / CAST(cart_sessions AS float) END AS cart_to_checkout_rate,
                                 CASE WHEN checkout_sessions = 0 THEN 0.0 ELSE CAST(purchase_sessions AS float) / CAST(checkout_sessions AS float) END AS checkout_to_purchase_rate,
                                 CASE WHEN view_sessions = 0 THEN 0.0 ELSE CAST(purchase_sessions AS float) / CAST(view_sessions AS float) END AS view_to_purchase_rate
-                            FROM merged
+                            FROM session_counts
                         )
                         INSERT INTO gold.funnel_daily
                             (metric_date, view_sessions, cart_sessions, checkout_sessions, purchase_sessions,

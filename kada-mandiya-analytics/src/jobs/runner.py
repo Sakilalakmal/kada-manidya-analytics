@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
@@ -10,7 +11,7 @@ from src.config import load_settings
 from src.db.engine import get_engine
 from src.jobs.locking import LockNotAcquired, db_lock
 from src.jobs.pipeline import run_pipeline
-from src.ops.run_logger import fail_stale_running_runs
+from src.ops.run_logger import fail_stale_running_runs, finish_run, start_run
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
@@ -30,7 +31,12 @@ def _pipeline_run_type(*, seed_mode: str, enable_silver: bool, enable_gold: bool
     return "+".join(parts) if parts else "pipeline"
 
 
-def run_pipeline_once(*, seed_mode: str = "business") -> dict[str, str]:
+def _record_skipped_run(*, run_type: str, reason: str) -> None:
+    run_id = start_run(run_type)
+    finish_run(run_id, "skipped", rows_inserted=0, error_message=reason)
+
+
+def run_pipeline_once(*, seed_mode: str = "business", run_type: str | None = None) -> dict[str, str]:
     settings = load_settings()
     engine = get_engine(settings)
 
@@ -47,7 +53,7 @@ def run_pipeline_once(*, seed_mode: str = "business") -> dict[str, str]:
         )
         return {"status": "skipped"}
 
-    run_label = _pipeline_run_type(
+    run_label = run_type or _pipeline_run_type(
         seed_mode=seed_mode_norm, enable_silver=enable_silver, enable_gold=enable_gold
     )
 
@@ -65,6 +71,8 @@ def run_pipeline_once(*, seed_mode: str = "business") -> dict[str, str]:
                     return {"status": "failed", "error": str(exc), "run": run_label}
         except LockNotAcquired:
             logger.info("Another ETL run is in progress; skipping.")
+            if run_type is not None:
+                _record_skipped_run(run_type=run_label, reason="Skipped: lock not acquired (another ETL run active).")
             return {"status": "skipped", "run": run_label}
 
 
@@ -72,8 +80,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run analytics ETL pipeline (seed -> silver -> gold)."
     )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--once", action="store_true", help="Run a single cycle and exit.")
+    mode_group.add_argument("--watch", action="store_true", help="Run forever; rebuild Silver then Gold on an interval.")
     parser.add_argument(
-        "--once", action="store_true", help="Run a single cycle and exit."
+        "--interval-seconds",
+        type=int,
+        default=60,
+        help="Watch interval in seconds (default: 60).",
+    )
+    parser.add_argument(
+        "--window-days",
+        type=int,
+        default=2,
+        help="Recompute window (days) for watch cycles via ETL_RECENT_DAYS (default: 2).",
     )
     seed_group = parser.add_mutually_exclusive_group()
     seed_group.add_argument(
@@ -89,19 +109,37 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = load_settings()
-    interval_s = max(5, int(getattr(settings, "etl_interval_seconds", 120) or 120))
+    default_seed_mode = "none" if args.watch else "business"
+    seed_mode = "all" if args.seed_all else ("none" if args.no_seed else default_seed_mode)
 
-    seed_mode = "all" if args.seed_all else ("none" if args.no_seed else "business")
+    watch_interval_s = max(5, int(args.interval_seconds or 60))
+    loop_interval_s = max(5, int(getattr(settings, "etl_interval_seconds", 120) or 120))
 
     if args.once:
         result = run_pipeline_once(seed_mode=seed_mode)
         return 0 if result["status"] in {"success", "skipped"} else 1
 
+    if args.watch:
+        os.environ["ETL_RECENT_DAYS"] = str(max(1, int(args.window_days or 2)))
+        run_type = "watch_silver+gold"
+        seed_mode_for_cycle = seed_mode
+        seeded_once = False
+        while True:
+            result = run_pipeline_once(seed_mode=seed_mode_for_cycle, run_type=run_type)
+            if result["status"] == "failed":
+                logger.error("Watch cycle failed (will retry next interval).")
+
+            if not seeded_once and seed_mode_for_cycle != "none":
+                seeded_once = True
+                seed_mode_for_cycle = "none"
+
+            time.sleep(watch_interval_s)
+
     while True:
         result = run_pipeline_once(seed_mode=seed_mode)
         if result["status"] == "failed":
             return 1
-        time.sleep(interval_s)
+        time.sleep(loop_interval_s)
 
 
 if __name__ == "__main__":

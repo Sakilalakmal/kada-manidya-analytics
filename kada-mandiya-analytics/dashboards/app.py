@@ -92,7 +92,7 @@ def executive():
     kpis = _safe_df(
         """
         SELECT
-            CAST(GETDATE() AS date) AS metric_date,
+            CAST(SYSUTCDATETIME() AS date) AS metric_date,
             COUNT(1) AS rows_count,
             SUM(CAST(total_revenue AS float)) AS total_revenue,
             SUM(CAST(total_orders AS float)) AS total_orders,
@@ -106,7 +106,7 @@ def executive():
                 ELSE AVG(CAST(payment_success_rate AS float))
             END AS payment_success_rate
         FROM gold.orders_payments_daily
-        WHERE CAST(metric_date AS date) = CAST(GETDATE() AS date);
+        WHERE CAST(metric_date AS date) = CAST(SYSUTCDATETIME() AS date);
         """
     )
 
@@ -133,7 +133,7 @@ def executive():
             CAST(metric_date AS date) AS metric_date,
             SUM(CAST(total_revenue AS float)) AS total_revenue
         FROM gold.orders_payments_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(GETDATE() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(SYSUTCDATETIME() AS date))
         GROUP BY CAST(metric_date AS date)
         ORDER BY metric_date DESC;
         """
@@ -204,7 +204,7 @@ def product():
             product_id,
             SUM(CAST(revenue AS float)) AS revenue
         FROM gold.product_metrics
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(GETDATE() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
         GROUP BY product_id
         ORDER BY revenue DESC;
         """
@@ -215,7 +215,7 @@ def product():
             product_id,
             SUM(CAST(purchases_count AS float)) AS purchases_count
         FROM gold.product_metrics
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(GETDATE() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
         GROUP BY product_id
         ORDER BY purchases_count DESC;
         """
@@ -262,7 +262,7 @@ def product():
             SUM(CAST(total_reviews AS int)) AS total_reviews_30d,
             SUM(CAST(five_star_reviews AS int)) AS five_star_reviews_30d
         FROM gold.reviews_quality
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(GETDATE() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
         GROUP BY product_id
         ORDER BY total_reviews_30d DESC;
         """
@@ -396,7 +396,7 @@ def ops():
             AVG(CAST(p95_latency_ms AS float)) AS p95_latency_ms,
             AVG(CAST(error_rate AS float)) AS error_rate
         FROM gold.system_health_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(GETDATE() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(SYSUTCDATETIME() AS date))
         GROUP BY CAST(metric_date AS date)
         ORDER BY metric_date DESC;
         """
@@ -430,7 +430,7 @@ def behavior():
             add_to_cart,
             purchases
         FROM gold.behavior_daily
-        WHERE CAST(metric_date AS date) = CAST(GETDATE() AS date);
+        WHERE CAST(metric_date AS date) = CAST(SYSUTCDATETIME() AS date);
         """,
         show_error=False,
     )
@@ -444,7 +444,7 @@ def behavior():
             purchase_sessions,
             view_to_purchase_rate
         FROM gold.funnel_daily
-        WHERE CAST(metric_date AS date) = CAST(GETDATE() AS date);
+        WHERE CAST(metric_date AS date) = CAST(SYSUTCDATETIME() AS date);
         """,
         show_error=False,
     )
@@ -470,7 +470,7 @@ def behavior():
             page_views,
             purchases
         FROM gold.behavior_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -{int(window_days) - 1}, CAST(GETDATE() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -{int(window_days) - 1}, CAST(SYSUTCDATETIME() AS date))
         ORDER BY metric_date DESC;
         """,
         show_error=False,
