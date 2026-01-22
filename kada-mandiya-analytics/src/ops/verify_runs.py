@@ -18,7 +18,7 @@ def main() -> int:
         rows = conn.execute(
             text("""
                 SELECT TOP 10
-                    run_id, run_type, started_at, finished_at, status, rows_inserted, error_message
+                    run_type, status, started_at, finished_at, error_message
                 FROM ops.etl_runs
                 ORDER BY COALESCE(finished_at, started_at) DESC;
                 """)
@@ -28,9 +28,8 @@ def main() -> int:
         print("last_10_runs:")
         for r in rows:
             print(
-                f"- run_id={r.get('run_id')} run_type={r.get('run_type')} "
-                f"status={r.get('status')} started_at={r.get('started_at')} "
-                f"finished_at={r.get('finished_at')} rows_inserted={r.get('rows_inserted')} "
+                f"- run_type={r.get('run_type')} status={r.get('status')} "
+                f"started_at={r.get('started_at')} finished_at={r.get('finished_at')} "
                 f"error_message={r.get('error_message')}"
             )
 

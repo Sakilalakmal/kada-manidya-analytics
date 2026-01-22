@@ -10,6 +10,7 @@ from src.config import load_settings
 from src.db.engine import get_engine
 from src.jobs.locking import LockNotAcquired, db_lock
 from src.jobs.pipeline import run_pipeline
+from src.ops.run_logger import fail_stale_running_runs
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
@@ -21,11 +22,17 @@ def _run_pipeline_job() -> None:
     settings = load_settings()
     engine = get_engine(settings)
 
+    enable_silver = bool(getattr(settings, "etl_enable_silver", True))
+    enable_gold = bool(getattr(settings, "etl_enable_gold", True))
+    run_type = "+".join([p for p, ok in (("silver", enable_silver), ("gold", enable_gold)) if ok]) or "pipeline"
+
+    fail_stale_running_runs(older_than_minutes=10)
+
     with engine.connect() as conn:
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         try:
             with db_lock(conn):
-                run_pipeline(run_type="pipeline_scheduled", include_seed=False)
+                run_pipeline(run_type=run_type, include_seed=False)
         except LockNotAcquired:
             logger.info("Another ETL run is in progress; skipping.")
         except Exception:
