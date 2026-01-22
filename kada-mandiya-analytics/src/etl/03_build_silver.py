@@ -69,14 +69,412 @@ def _delete_order_items(conn, order_ids: list[str]) -> int:
     return int(getattr(result, "rowcount", 0) or 0)
 
 
+def _table_exists(conn, qualified_name: str) -> bool:
+    oid = conn.execute(text("SELECT OBJECT_ID(:name, 'U');"), {"name": qualified_name}).scalar()
+    return oid is not None
+
+
+def _table_columns(conn, qualified_name: str) -> set[str]:
+    rows = conn.execute(
+        text("""
+            SELECT c.name
+            FROM sys.columns c
+            WHERE c.object_id = OBJECT_ID(:name, 'U');
+        """),
+        {"name": qualified_name},
+    ).mappings()
+    return {str(r["name"]).lower() for r in rows}
+
+
+def _ensure_behavior_tables(conn) -> None:
+    conn.execute(
+        text("""
+        IF OBJECT_ID('silver.web_events', 'U') IS NULL
+        BEGIN
+            CREATE TABLE silver.web_events(
+                event_id uniqueidentifier NOT NULL
+                    CONSTRAINT DF_silver_web_events_event_id DEFAULT NEWID()
+                    CONSTRAINT PK_silver_web_events PRIMARY KEY,
+                event_timestamp datetime2 NOT NULL,
+                event_date date NOT NULL,
+                session_id nvarchar(64) NOT NULL,
+                user_id nvarchar(64) NULL,
+                event_type nvarchar(64) NOT NULL,
+                page_url nvarchar(2000) NOT NULL,
+                product_id nvarchar(64) NULL,
+                element_id nvarchar(255) NULL,
+                properties_json nvarchar(max) NULL
+            );
+        END
+
+        IF OBJECT_ID('silver.purchases', 'U') IS NULL
+        BEGIN
+            CREATE TABLE silver.purchases(
+                order_id nvarchar(64) NOT NULL CONSTRAINT PK_silver_purchases PRIMARY KEY,
+                event_timestamp datetime2 NOT NULL,
+                event_date date NOT NULL,
+                user_id nvarchar(64) NULL,
+                total_amount decimal(12,2) NULL,
+                currency nvarchar(10) NULL,
+                correlation_id nvarchar(64) NULL,
+                source_service nvarchar(64) NULL
+            );
+        END
+        """)
+    )
+
+
+def build_silver_web_events(conn) -> int:
+    _ensure_behavior_tables(conn)
+
+    max_ts = conn.execute(text("SELECT MAX(event_timestamp) FROM silver.web_events;")).scalar()
+    if max_ts is None:
+        since_ts = to_sqlserver_utc_naive(utc_now() - timedelta(days=30))
+    else:
+        since_ts = max_ts - timedelta(minutes=2)
+
+    if _table_exists(conn, "bronze.tracker_events"):
+        cols = _table_columns(conn, "bronze.tracker_events")
+        if "event_timestamp" not in cols and "timestamp" not in cols:
+            cols = set()
+        has_event_id = "event_id" in cols
+        has_event_type = "event_type" in cols
+        has_page_url = "page_url" in cols
+        has_element_id = "element_id" in cols
+        has_session_id = "session_id" in cols
+        has_user_id = "user_id" in cols
+
+        if not cols or not has_session_id:
+            sql = ""
+        else:
+            ts_col = "t.event_timestamp" if "event_timestamp" in cols else "t.[timestamp]"
+
+            src_event_id = "t.event_id" if has_event_id else "CAST(NULL AS uniqueidentifier)"
+            src_event_type = "t.event_type" if has_event_type else "JSON_VALUE(t.properties, '$.event_type')"
+            src_page_url = (
+                "t.page_url" if has_page_url else "JSON_VALUE(t.properties, '$.page_url')"
+            )
+            src_element_id = (
+                "t.element_id" if has_element_id else "JSON_VALUE(t.properties, '$.element_id')"
+            )
+            src_user_id = "t.user_id" if has_user_id else "JSON_VALUE(t.properties, '$.user_id')"
+
+            sql = f"""
+            ;WITH src AS (
+                SELECT
+                    {src_event_id} AS source_event_id,
+                    {ts_col} AS event_timestamp,
+                    CAST({ts_col} AS date) AS event_date,
+                    t.session_id,
+                    {src_user_id} AS user_id,
+                    COALESCE({src_event_type}, 'unknown') AS event_type,
+                    COALESCE({src_page_url}, '') AS page_url,
+                COALESCE(
+                    JSON_VALUE(t.properties, '$.product_id'),
+                    CASE
+                        WHEN COALESCE({src_page_url}, '') LIKE '/products/%'
+                            THEN RIGHT(COALESCE({src_page_url}, ''), CHARINDEX('/', REVERSE(COALESCE({src_page_url}, ''))) - 1)
+                            ELSE NULL
+                        END
+                ) AS product_id,
+                {src_element_id} AS element_id,
+                t.properties AS properties_json
+            FROM bronze.tracker_events t
+            WHERE {ts_col} >= :since_ts
+            ),
+            dedup AS (
+                SELECT
+                    event_timestamp,
+                    event_date,
+                    session_id,
+                    user_id,
+                    event_type,
+                    page_url,
+                    product_id,
+                    element_id,
+                    properties_json,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            event_timestamp,
+                            session_id,
+                            event_type,
+                            page_url,
+                            ISNULL(element_id, ''),
+                            ISNULL(product_id, '')
+                        ORDER BY source_event_id
+                    ) AS rn
+                FROM src
+            )
+            INSERT INTO silver.web_events
+                (event_timestamp, event_date, session_id, user_id, event_type, page_url, product_id, element_id, properties_json)
+            SELECT
+                d.event_timestamp,
+                d.event_date,
+                d.session_id,
+                d.user_id,
+                d.event_type,
+                d.page_url,
+                d.product_id,
+                d.element_id,
+                d.properties_json
+            FROM dedup d
+            WHERE d.rn = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM silver.web_events w
+                  WHERE w.event_timestamp = d.event_timestamp
+                    AND w.session_id = d.session_id
+                    AND w.event_type = d.event_type
+                    AND w.page_url = d.page_url
+                    AND ISNULL(w.element_id, '') = ISNULL(d.element_id, '')
+                    AND ISNULL(w.product_id, '') = ISNULL(d.product_id, '')
+              );
+            """
+    else:
+        sql = """
+        ;WITH src AS (
+            SELECT
+                pv.event_id AS source_event_id,
+                pv.event_timestamp,
+                CAST(pv.event_timestamp AS date) AS event_date,
+                pv.session_id,
+                pv.user_id,
+                'page_view' AS event_type,
+                pv.page_url,
+                COALESCE(
+                    JSON_VALUE(pv.properties, '$.product_id'),
+                    CASE
+                        WHEN pv.page_url LIKE '/products/%'
+                        THEN RIGHT(pv.page_url, CHARINDEX('/', REVERSE(pv.page_url)) - 1)
+                        ELSE NULL
+                    END
+                ) AS product_id,
+                CAST(NULL AS nvarchar(255)) AS element_id,
+                pv.properties AS properties_json
+            FROM bronze.page_view_events pv
+            WHERE pv.event_timestamp >= :since_ts
+
+            UNION ALL
+
+            SELECT
+                ce.event_id AS source_event_id,
+                ce.event_timestamp,
+                CAST(ce.event_timestamp AS date) AS event_date,
+                ce.session_id,
+                ce.user_id,
+                CASE
+                    WHEN ce.element_id = 'btn_add_to_cart' THEN 'add_to_cart'
+                    WHEN COALESCE(JSON_VALUE(ce.properties, '$.interaction_type'), '') = 'add_to_cart' THEN 'add_to_cart'
+                    WHEN ce.element_id = 'btn_checkout' THEN 'begin_checkout'
+                    WHEN COALESCE(JSON_VALUE(ce.properties, '$.interaction_type'), '') IN ('checkout_started', 'begin_checkout') THEN 'begin_checkout'
+                    ELSE 'click'
+                END AS event_type,
+                ce.page_url,
+                COALESCE(
+                    JSON_VALUE(ce.properties, '$.product_id'),
+                    CASE
+                        WHEN ce.page_url LIKE '/products/%'
+                        THEN RIGHT(ce.page_url, CHARINDEX('/', REVERSE(ce.page_url)) - 1)
+                        ELSE NULL
+                    END
+                ) AS product_id,
+                ce.element_id,
+                ce.properties AS properties_json
+            FROM bronze.click_events ce
+            WHERE ce.event_timestamp >= :since_ts
+
+            UNION ALL
+
+            SELECT
+                se.event_id AS source_event_id,
+                se.event_timestamp,
+                CAST(se.event_timestamp AS date) AS event_date,
+                se.session_id,
+                se.user_id,
+                'scroll' AS event_type,
+                se.page_url,
+                COALESCE(JSON_VALUE(se.properties, '$.product_id'), NULL) AS product_id,
+                CAST(NULL AS nvarchar(255)) AS element_id,
+                se.properties AS properties_json
+            FROM bronze.scroll_events se
+            WHERE se.event_timestamp >= :since_ts
+
+            UNION ALL
+
+            SELECT
+                sr.event_id AS source_event_id,
+                sr.event_timestamp,
+                CAST(sr.event_timestamp AS date) AS event_date,
+                sr.session_id,
+                sr.user_id,
+                'search' AS event_type,
+                sr.page_url,
+                COALESCE(JSON_VALUE(sr.properties, '$.product_id'), NULL) AS product_id,
+                CAST(NULL AS nvarchar(255)) AS element_id,
+                COALESCE(
+                    sr.properties,
+                    CONCAT(
+                        '{\"query\":', QUOTENAME(ISNULL(sr.query, N''), '\"'),
+                        ',\"results_count\":', COALESCE(CONVERT(varchar(20), sr.results_count), 'null'),
+                        ',\"filters\":', COALESCE(sr.filters, 'null'),
+                        '}'
+                    )
+                ) AS properties_json
+            FROM bronze.search_events sr
+            WHERE sr.event_timestamp >= :since_ts
+        ),
+        dedup AS (
+            SELECT
+                event_timestamp,
+                event_date,
+                session_id,
+                user_id,
+                event_type,
+                page_url,
+                product_id,
+                element_id,
+                properties_json,
+                ROW_NUMBER() OVER (
+                    PARTITION BY
+                        event_timestamp,
+                        session_id,
+                        event_type,
+                        page_url,
+                        ISNULL(element_id, ''),
+                        ISNULL(product_id, '')
+                    ORDER BY source_event_id
+                ) AS rn
+            FROM src
+        )
+        INSERT INTO silver.web_events
+            (event_timestamp, event_date, session_id, user_id, event_type, page_url, product_id, element_id, properties_json)
+        SELECT
+            d.event_timestamp,
+            d.event_date,
+            d.session_id,
+            d.user_id,
+            d.event_type,
+            d.page_url,
+            d.product_id,
+            d.element_id,
+            d.properties_json
+        FROM dedup d
+        WHERE d.rn = 1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM silver.web_events w
+              WHERE w.event_timestamp = d.event_timestamp
+                AND w.session_id = d.session_id
+                AND w.event_type = d.event_type
+                AND w.page_url = d.page_url
+                AND ISNULL(w.element_id, '') = ISNULL(d.element_id, '')
+                AND ISNULL(w.product_id, '') = ISNULL(d.product_id, '')
+          );
+        """
+
+    if not sql:
+        return 0
+
+    res = conn.execute(text(sql), {"since_ts": since_ts})
+    rc = int(getattr(res, "rowcount", 0) or 0)
+    return rc if rc > 0 else 0
+
+
+def build_silver_purchases(conn) -> int:
+    _ensure_behavior_tables(conn)
+
+    since_ts = to_sqlserver_utc_naive(utc_now() - timedelta(days=30))
+    res = conn.execute(
+        text(
+            """
+            ;WITH src AS (
+                SELECT
+                    be.event_timestamp,
+                    CAST(be.event_timestamp AS date) AS event_date,
+                    COALESCE(
+                        be.entity_id,
+                        JSON_VALUE(be.payload, '$.order_id'),
+                        JSON_VALUE(be.payload, '$.data.order_id'),
+                        JSON_VALUE(be.payload, '$.order.order_id')
+                    ) AS order_id,
+                    be.user_id,
+                    TRY_CONVERT(
+                        decimal(12,2),
+                        COALESCE(
+                            JSON_VALUE(be.payload, '$.total_amount'),
+                            JSON_VALUE(be.payload, '$.data.total_amount'),
+                            JSON_VALUE(be.payload, '$.order.total_amount'),
+                            JSON_VALUE(be.payload, '$.amount'),
+                            JSON_VALUE(be.payload, '$.data.amount')
+                        )
+                    ) AS total_amount,
+                    COALESCE(
+                        JSON_VALUE(be.payload, '$.currency'),
+                        JSON_VALUE(be.payload, '$.data.currency'),
+                        JSON_VALUE(be.payload, '$.order.currency'),
+                        JSON_VALUE(be.payload, '$.payment.currency')
+                    ) AS currency,
+                    be.correlation_id,
+                    be.service AS source_service,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(
+                            be.entity_id,
+                            JSON_VALUE(be.payload, '$.order_id'),
+                            JSON_VALUE(be.payload, '$.data.order_id'),
+                            JSON_VALUE(be.payload, '$.order.order_id')
+                        )
+                        ORDER BY be.event_timestamp ASC
+                    ) AS rn
+                FROM bronze.business_events be
+                WHERE be.event_timestamp >= :since_ts
+                  AND LOWER(LTRIM(RTRIM(be.event_type))) IN (
+                      'order_paid',
+                      'order.paid',
+                      'payment.succeeded',
+                      'payment.success',
+                      'payment_success'
+                  )
+            ),
+            dedup AS (
+                SELECT *
+                FROM src
+                WHERE rn = 1 AND order_id IS NOT NULL
+            )
+            MERGE silver.purchases AS tgt
+            USING dedup AS src
+            ON tgt.order_id = src.order_id
+            WHEN NOT MATCHED THEN
+                INSERT (order_id, event_timestamp, event_date, user_id, total_amount, currency, correlation_id, source_service)
+                VALUES (src.order_id, src.event_timestamp, src.event_date, src.user_id, src.total_amount, src.currency, src.correlation_id, src.source_service)
+            WHEN MATCHED AND src.event_timestamp < tgt.event_timestamp THEN
+                UPDATE SET
+                    tgt.event_timestamp = src.event_timestamp,
+                    tgt.event_date = src.event_date,
+                    tgt.user_id = src.user_id,
+                    tgt.total_amount = src.total_amount,
+                    tgt.currency = src.currency,
+                    tgt.correlation_id = src.correlation_id,
+                    tgt.source_service = src.source_service;
+            """
+        ),
+        {"since_ts": since_ts},
+    )
+    rc = int(getattr(res, "rowcount", 0) or 0)
+    return rc if rc > 0 else 0
+
+
 def main() -> int:
     args = _parse_args()
     settings = load_settings()
     engine = get_engine(settings)
 
+    since_interactions = to_sqlserver_utc_naive(utc_now() - timedelta(days=7))
+
     with engine.begin() as conn:
         run = start_run(conn, "build_silver")
         try:
+            web_rows_inserted = build_silver_web_events(conn)
+
             # Web/session silver tables (existing)
             conn.execute(text("""
                     ;WITH pv_ordered AS (
@@ -196,29 +594,77 @@ def main() -> int:
                     FROM bronze.page_view_events;
                     """))
 
-            conn.execute(text("""
-                    ;WITH src AS (
+            conn.execute(
+                text(
+                    "DELETE FROM silver.product_interactions WHERE event_timestamp >= :since;"
+                ),
+                {"since": since_interactions},
+            )
+            conn.execute(
+                text(
+                    """
+                    ;WITH views AS (
+                        SELECT
+                            pv.event_timestamp,
+                            pv.session_id,
+                            pv.user_id,
+                            COALESCE(
+                                JSON_VALUE(pv.properties, '$.product_id'),
+                                CASE
+                                    WHEN pv.page_url LIKE '/products/%'
+                                    THEN RIGHT(pv.page_url, CHARINDEX('/', REVERSE(pv.page_url)) - 1)
+                                    ELSE NULL
+                                END
+                            ) AS product_id,
+                            'view' AS interaction_type,
+                            pv.properties
+                        FROM bronze.page_view_events pv
+                        WHERE pv.event_timestamp >= :since
+                          AND pv.page_url LIKE '/products/%'
+                    ),
+                    clicks AS (
                         SELECT
                             ce.event_timestamp,
                             ce.session_id,
                             ce.user_id,
-                            JSON_VALUE(ce.properties, '$.product_id') AS product_id,
-                            COALESCE(JSON_VALUE(ce.properties, '$.interaction_type'), 'click') AS interaction_type,
+                            COALESCE(
+                                JSON_VALUE(ce.properties, '$.product_id'),
+                                CASE
+                                    WHEN ce.page_url LIKE '/products/%'
+                                    THEN RIGHT(ce.page_url, CHARINDEX('/', REVERSE(ce.page_url)) - 1)
+                                    ELSE NULL
+                                END
+                            ) AS product_id,
+                            CASE
+                                WHEN ce.element_id = 'btn_add_to_cart' THEN 'add_to_cart'
+                                WHEN COALESCE(JSON_VALUE(ce.properties, '$.interaction_type'), '') = 'add_to_cart' THEN 'add_to_cart'
+                                ELSE 'click'
+                            END AS interaction_type,
                             ce.properties
                         FROM bronze.click_events ce
-                        WHERE ce.properties IS NOT NULL
-                          AND JSON_VALUE(ce.properties, '$.product_id') IS NOT NULL
+                        WHERE ce.event_timestamp >= :since
+                          AND ce.page_url LIKE '/products/%'
+                    ),
+                    src AS (
+                        SELECT event_timestamp, session_id, user_id, product_id, interaction_type, properties FROM views
+                        UNION ALL
+                        SELECT event_timestamp, session_id, user_id, product_id, interaction_type, properties FROM clicks
                     )
-                    MERGE silver.product_interactions AS tgt
-                    USING src
-                    ON tgt.session_id = src.session_id
-                       AND tgt.event_timestamp = src.event_timestamp
-                       AND tgt.product_id = src.product_id
-                       AND tgt.interaction_type = src.interaction_type
-                    WHEN NOT MATCHED THEN
-                        INSERT (event_timestamp, session_id, user_id, product_id, interaction_type, properties)
-                        VALUES (src.event_timestamp, src.session_id, src.user_id, src.product_id, src.interaction_type, src.properties);
-                    """))
+                    INSERT INTO silver.product_interactions
+                        (event_timestamp, session_id, user_id, product_id, interaction_type, properties)
+                    SELECT DISTINCT
+                        event_timestamp,
+                        session_id,
+                        user_id,
+                        product_id,
+                        interaction_type,
+                        properties
+                    FROM src
+                    WHERE product_id IS NOT NULL;
+                    """
+                ),
+                {"since": since_interactions},
+            )
 
             # Business silver tables from bronze.business_events (recompute window)
             since = to_sqlserver_utc_naive(utc_now() - timedelta(days=int(args.days)))
@@ -609,7 +1055,42 @@ def main() -> int:
                         )
                         rows_inserted += int(getattr(res, "rowcount", 0) or 0)
 
-            finish_run(conn, run, rows_inserted=rows_inserted)
+            # Purchases -> product_interactions (after orders + order_items are refreshed)
+            res = conn.execute(
+                text(
+                    """
+                    INSERT INTO silver.product_interactions
+                        (event_timestamp, session_id, user_id, product_id, interaction_type, properties)
+                    SELECT DISTINCT
+                        o.updated_at AS event_timestamp,
+                        COALESCE(o.correlation_id, o.order_id) AS session_id,
+                        o.user_id,
+                        oi.product_id,
+                        'purchase' AS interaction_type,
+                        CONCAT(
+                            '{',
+                                '\"order_id\":\"', REPLACE(COALESCE(o.order_id, ''), '\"', ''), '\",',
+                                '\"source\":\"silver.orders\",',
+                                '\"status\":\"', REPLACE(COALESCE(o.status, ''), '\"', ''), '\"',
+                            '}'
+                        ) AS properties
+                    FROM silver.orders o
+                    INNER JOIN silver.order_items oi ON o.order_id = oi.order_id
+                    WHERE o.status = 'paid'
+                      AND o.updated_at >= :since;
+                    """
+                ),
+                {"since": since_interactions},
+            )
+            rows_inserted += int(getattr(res, "rowcount", 0) or 0)
+
+            purchase_rows_inserted = build_silver_purchases(conn)
+
+            finish_run(
+                conn,
+                run,
+                rows_inserted=int(rows_inserted) + int(web_rows_inserted) + int(purchase_rows_inserted),
+            )
         except Exception as exc:
             fail_run(conn, run, str(exc))
             raise

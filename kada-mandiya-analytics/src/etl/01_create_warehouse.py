@@ -368,7 +368,7 @@ def main() -> int:
                 funnel_step varchar(50) NOT NULL,
                 step_order int NOT NULL,
                 users_count int NOT NULL,
-                drop_off_rate decimal(5,4) NULL,
+                drop_off_rate decimal(9,6) NULL,
                 CONSTRAINT PK_gold_conversion_funnel PRIMARY KEY (funnel_date, funnel_step)
             );
         END
