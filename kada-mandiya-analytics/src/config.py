@@ -22,6 +22,7 @@ class Settings(BaseModel):
     db_driver: str = Field(default="ODBC Driver 18 for SQL Server", alias="DB_DRIVER")
     db_trust_cert: bool = Field(default=True, alias="DB_TRUST_CERT")
     analytics_api_key: SecretStr | None = Field(default=None, alias="ANALYTICS_API_KEY")
+    show_seed_data: bool = Field(default=False, alias="SHOW_SEED_DATA")
 
     rabbitmq_url: str = Field(
         default="amqp://guest:guest@localhost:5672/", alias="RABBITMQ_URL"

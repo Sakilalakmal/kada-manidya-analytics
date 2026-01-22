@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 from loguru import logger
-from sqlalchemy.exc import DBAPIError, OperationalError
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from src.config import load_settings
 from src.db.engine import get_engine
@@ -17,23 +16,13 @@ logger.remove()
 logger.add(sys.stderr, level="INFO")
 
 
-TRANSIENT_DB_EXC = (OperationalError, DBAPIError)
-
-
-@retry(
-    retry=retry_if_exception_type(TRANSIENT_DB_EXC),
-    stop=stop_after_attempt(3),
-    wait=wait_fixed(2),
-    reraise=True,
-)
-def _run_pipeline(*, run_type: str, include_seed: bool) -> None:
-    run_pipeline(run_type=run_type, include_seed=include_seed)
-
-
-def _pipeline_run_type(*, include_seed: bool, enable_silver: bool, enable_gold: bool) -> str:
+def _pipeline_run_type(*, seed_mode: str, enable_silver: bool, enable_gold: bool) -> str:
     parts: list[str] = []
-    if include_seed:
+    seed_mode_norm = str(seed_mode or "business").strip().lower()
+    if seed_mode_norm == "business":
         parts.append("seed")
+    elif seed_mode_norm == "all":
+        parts.append("seed-all")
     if enable_silver:
         parts.append("silver")
     if enable_gold:
@@ -41,21 +30,25 @@ def _pipeline_run_type(*, include_seed: bool, enable_silver: bool, enable_gold: 
     return "+".join(parts) if parts else "pipeline"
 
 
-def run_pipeline_once(*, include_seed: bool = True) -> dict[str, str]:
+def run_pipeline_once(*, seed_mode: str = "business") -> dict[str, str]:
     settings = load_settings()
     engine = get_engine(settings)
 
     enable_silver = bool(getattr(settings, "etl_enable_silver", True))
     enable_gold = bool(getattr(settings, "etl_enable_gold", True))
 
-    if not include_seed and not enable_silver and not enable_gold:
+    seed_mode_norm = str(seed_mode or "business").strip().lower()
+    if seed_mode_norm not in {"none", "business", "all"}:
+        raise ValueError("seed_mode must be one of: none, business, all")
+
+    if seed_mode_norm == "none" and not enable_silver and not enable_gold:
         logger.info(
             "Pipeline skipped (ETL_ENABLE_SILVER=no and ETL_ENABLE_GOLD=no and --no-seed)."
         )
         return {"status": "skipped"}
 
     run_label = _pipeline_run_type(
-        include_seed=include_seed, enable_silver=enable_silver, enable_gold=enable_gold
+        seed_mode=seed_mode_norm, enable_silver=enable_silver, enable_gold=enable_gold
     )
 
     fail_stale_running_runs(older_than_minutes=10)
@@ -65,7 +58,7 @@ def run_pipeline_once(*, include_seed: bool = True) -> dict[str, str]:
         try:
             with db_lock(conn):
                 try:
-                    _run_pipeline(run_type=run_label, include_seed=include_seed)
+                    run_pipeline(run_type=run_label, seed_mode=seed_mode_norm)
                     return {"status": "success"}
                 except Exception as exc:
                     logger.error("ETL failed: {}", exc)
@@ -82,17 +75,33 @@ def main() -> int:
     parser.add_argument(
         "--once", action="store_true", help="Run a single cycle and exit."
     )
-    parser.add_argument(
-        "--no-seed", action="store_true", help="Skip the seed step (DEV-only)."
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument(
+        "--no-seed",
+        action="store_true",
+        help="Skip all seed steps (business + behavior).",
+    )
+    seed_group.add_argument(
+        "--seed-all",
+        action="store_true",
+        help="Run all seed steps (02b + 02c) before silver+gold.",
     )
     args = parser.parse_args()
 
+    settings = load_settings()
+    interval_s = max(5, int(getattr(settings, "etl_interval_seconds", 120) or 120))
+
+    seed_mode = "all" if args.seed_all else ("none" if args.no_seed else "business")
+
     if args.once:
-        result = run_pipeline_once(include_seed=not args.no_seed)
+        result = run_pipeline_once(seed_mode=seed_mode)
         return 0 if result["status"] in {"success", "skipped"} else 1
 
-    result = run_pipeline_once(include_seed=not args.no_seed)
-    return 0 if result["status"] in {"success", "skipped"} else 1
+    while True:
+        result = run_pipeline_once(seed_mode=seed_mode)
+        if result["status"] == "failed":
+            return 1
+        time.sleep(interval_s)
 
 
 if __name__ == "__main__":

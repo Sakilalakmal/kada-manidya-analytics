@@ -17,9 +17,13 @@ st.set_page_config(page_title="Kada Mandiya Analytics", layout="wide")
 
 
 @st.cache_resource
+def get_settings():
+    return load_settings()
+
+
+@st.cache_resource
 def get_engine():
-    settings = load_settings()
-    return build_engine(settings)
+    return build_engine(get_settings())
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -531,6 +535,13 @@ PAGES = {
     "Product": product,
     "Ops": ops,
 }
+
+try:
+    st.sidebar.caption(
+        f"Seed data: {'ON' if bool(get_settings().show_seed_data) else 'OFF'} (SHOW_SEED_DATA)"
+    )
+except Exception:
+    pass
 
 choice = st.sidebar.radio("Navigation", list(PAGES.keys()))
 PAGES[choice]()
