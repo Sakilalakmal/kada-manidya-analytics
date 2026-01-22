@@ -145,6 +145,50 @@ def executive():
     trend["metric_date"] = pd.to_datetime(trend["metric_date"])
     st.line_chart(trend.set_index("metric_date")["total_revenue"])
 
+    st.subheader("Funnel (Latest Day)")
+    funnel_date = _latest_date("gold.funnel_daily", "metric_date")
+    if not funnel_date:
+        st.caption("gold.funnel_daily not available (or empty).")
+        return
+
+    df = _safe_df(
+        """
+        SELECT TOP 1
+            CAST(metric_date AS date) AS metric_date,
+            view_sessions,
+            cart_sessions,
+            checkout_sessions,
+            purchase_sessions,
+            view_to_cart_rate,
+            cart_to_checkout_rate,
+            checkout_to_purchase_rate,
+            view_to_purchase_rate
+        FROM gold.funnel_daily
+        WHERE CAST(metric_date AS date) = CAST(:d AS date);
+        """,
+        {"d": funnel_date},
+        show_error=False,
+    )
+    if df.empty:
+        st.caption("No funnel rows for latest day yet.")
+        return
+
+    r = df.iloc[0].to_dict()
+    st.caption(f"Latest funnel date: {funnel_date}")
+    steps = pd.DataFrame(
+        {
+            "step": ["view", "add_to_cart", "begin_checkout", "purchase"],
+            "sessions": [
+                int(r.get("view_sessions") or 0),
+                int(r.get("cart_sessions") or 0),
+                int(r.get("checkout_sessions") or 0),
+                int(r.get("purchase_sessions") or 0),
+            ],
+        }
+    )
+    st.bar_chart(steps.set_index("step")["sessions"])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
 
 def product():
     st.header("Product")
@@ -369,8 +413,121 @@ def ops():
             st.line_chart(health.set_index("metric_date")["error_rate"])
 
 
+def behavior():
+    st.header("Behavior")
+    window_days = st.selectbox("Window", [14, 30], index=0)
+
+    today = _safe_df(
+        """
+        SELECT TOP 1
+            CAST(metric_date AS date) AS metric_date,
+            sessions,
+            page_views,
+            add_to_cart,
+            purchases
+        FROM gold.behavior_daily
+        WHERE CAST(metric_date AS date) = CAST(GETDATE() AS date);
+        """,
+        show_error=False,
+    )
+    funnel_today = _safe_df(
+        """
+        SELECT TOP 1
+            CAST(metric_date AS date) AS metric_date,
+            view_sessions,
+            cart_sessions,
+            checkout_sessions,
+            purchase_sessions,
+            view_to_purchase_rate
+        FROM gold.funnel_daily
+        WHERE CAST(metric_date AS date) = CAST(GETDATE() AS date);
+        """,
+        show_error=False,
+    )
+
+    sessions = 0 if today.empty else int(today.loc[0, "sessions"] or 0)
+    page_views = 0 if today.empty else int(today.loc[0, "page_views"] or 0)
+    add_to_cart = 0 if today.empty else int(today.loc[0, "add_to_cart"] or 0)
+    purchases = 0 if today.empty else int(today.loc[0, "purchases"] or 0)
+    view_to_purchase = None if funnel_today.empty else funnel_today.loc[0, "view_to_purchase_rate"]
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Sessions Today", _fmt_int(sessions))
+    c2.metric("Page Views Today", _fmt_int(page_views))
+    c3.metric("Add-to-cart Today", _fmt_int(add_to_cart))
+    c4.metric("Purchases Today", _fmt_int(purchases))
+    c5.metric("View->Purchase %", _fmt_pct(view_to_purchase))
+
+    series = _safe_df(
+        f"""
+        SELECT TOP {int(window_days)}
+            CAST(metric_date AS date) AS metric_date,
+            sessions,
+            page_views,
+            purchases
+        FROM gold.behavior_daily
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -{int(window_days) - 1}, CAST(GETDATE() AS date))
+        ORDER BY metric_date DESC;
+        """,
+        show_error=False,
+    )
+    st.subheader(f"Last {window_days} Days")
+    if series.empty:
+        st.info("No behavior data available yet. Run the silver+gold ETL to populate gold.behavior_daily.")
+    else:
+        series = series.sort_values("metric_date")
+        series["metric_date"] = pd.to_datetime(series["metric_date"])
+        st.line_chart(series.set_index("metric_date")[["sessions", "page_views", "purchases"]])
+
+    st.subheader("Funnel (Latest Day)")
+    funnel_date = _latest_date("gold.funnel_daily", "metric_date")
+    if not funnel_date:
+        st.caption("gold.funnel_daily not available (or empty).")
+        return
+
+    funnel = _safe_df(
+        """
+        SELECT TOP 1
+            CAST(metric_date AS date) AS metric_date,
+            view_sessions,
+            cart_sessions,
+            checkout_sessions,
+            purchase_sessions,
+            view_to_cart_rate,
+            cart_to_checkout_rate,
+            checkout_to_purchase_rate,
+            view_to_purchase_rate
+        FROM gold.funnel_daily
+        WHERE CAST(metric_date AS date) = CAST(:d AS date);
+        """,
+        {"d": funnel_date},
+        show_error=False,
+    )
+    if funnel.empty:
+        st.caption("No funnel rows for latest day yet.")
+        return
+
+    st.caption(f"Latest funnel date: {funnel_date}")
+    st.dataframe(funnel, use_container_width=True, hide_index=True)
+
+    r = funnel.iloc[0].to_dict()
+    steps = pd.DataFrame(
+        {
+            "step": ["view", "add_to_cart", "begin_checkout", "purchase"],
+            "sessions": [
+                int(r.get("view_sessions") or 0),
+                int(r.get("cart_sessions") or 0),
+                int(r.get("checkout_sessions") or 0),
+                int(r.get("purchase_sessions") or 0),
+            ],
+        }
+    )
+    st.bar_chart(steps.set_index("step")["sessions"])
+
+
 PAGES = {
     "Executive": executive,
+    "Behavior": behavior,
     "Product": product,
     "Ops": ops,
 }

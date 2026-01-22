@@ -14,6 +14,75 @@ def _exec(conn, sql: str) -> None:
     conn.execute(text(sql))
 
 
+def _exec_params(conn, sql: str, params: dict[str, object]) -> None:
+    conn.execute(text(sql), params)
+
+
+def _ensure_behavior_gold_tables(conn) -> None:
+    conn.execute(
+        text(
+            """
+            IF OBJECT_ID('gold.behavior_daily', 'U') IS NULL
+            BEGIN
+                CREATE TABLE gold.behavior_daily(
+                    metric_date date NOT NULL CONSTRAINT PK_gold_behavior_daily PRIMARY KEY,
+                    sessions int NOT NULL,
+                    unique_users int NOT NULL,
+                    page_views int NOT NULL,
+                    clicks int NOT NULL,
+                    add_to_cart int NOT NULL,
+                    begin_checkout int NOT NULL,
+                    purchases int NOT NULL
+                );
+            END
+
+            IF OBJECT_ID('gold.funnel_daily', 'U') IS NULL
+            BEGIN
+                CREATE TABLE gold.funnel_daily(
+                    metric_date date NOT NULL CONSTRAINT PK_gold_funnel_daily PRIMARY KEY,
+                    view_sessions int NOT NULL,
+                    cart_sessions int NOT NULL,
+                    checkout_sessions int NOT NULL,
+                    purchase_sessions int NOT NULL,
+                    view_to_cart_rate float NOT NULL,
+                    cart_to_checkout_rate float NOT NULL,
+                    checkout_to_purchase_rate float NOT NULL,
+                    view_to_purchase_rate float NOT NULL
+                );
+            END
+            """
+        )
+    )
+
+
+def _ensure_conversion_funnel_schema(conn) -> None:
+    conn.execute(
+        text(
+            """
+            IF COL_LENGTH('gold.conversion_funnel', 'drop_off_rate') IS NOT NULL
+            BEGIN
+                DECLARE @precision int;
+                DECLARE @scale int;
+
+                SELECT
+                    @precision = c.[precision],
+                    @scale = c.[scale]
+                FROM sys.columns c
+                INNER JOIN sys.objects o ON c.object_id = o.object_id
+                INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+                WHERE s.name = 'gold'
+                  AND o.name = 'conversion_funnel'
+                  AND c.name = 'drop_off_rate';
+
+                IF @precision < 9 OR @scale < 6
+                    ALTER TABLE gold.conversion_funnel
+                    ALTER COLUMN drop_off_rate decimal(9,6) NULL;
+            END
+            """
+        )
+    )
+
+
 def _safe_rowcount(result) -> int:
     rc = getattr(result, "rowcount", 0)
     try:
@@ -33,23 +102,56 @@ def main() -> int:
             since_date = (utc_now() - timedelta(days=30)).date()
             rows_inserted = 0
 
-            _exec(
+            _ensure_behavior_gold_tables(conn)
+            _ensure_conversion_funnel_schema(conn)
+
+            _exec_params(
                 conn,
                 """
-                ;WITH base AS (
+                ;WITH pv AS (
                     SELECT
                         CAST(event_timestamp AS date) AS funnel_date,
-                        COALESCE(user_id, session_id) AS visitor_id,
+                        session_id,
                         page_url
                     FROM bronze.page_view_events
+                    WHERE event_timestamp >= :since_date
+                ),
+                checkout_events AS (
+                    SELECT
+                        CAST(event_timestamp AS date) AS funnel_date,
+                        session_id
+                    FROM bronze.page_view_events
+                    WHERE event_timestamp >= :since_date
+                      AND page_url = '/checkout'
+
+                    UNION
+
+                    SELECT
+                        CAST(event_timestamp AS date) AS funnel_date,
+                        session_id
+                    FROM bronze.click_events
+                    WHERE event_timestamp >= :since_date
+                      AND element_id = 'btn_checkout'
                 ),
                 steps AS (
                     SELECT
                         funnel_date,
-                        'visit' AS funnel_step,
+                        'visit_home' AS funnel_step,
                         1 AS step_order,
-                        COUNT(DISTINCT visitor_id) AS users_count
-                    FROM base
+                        COUNT(DISTINCT session_id) AS users_count
+                    FROM pv
+                    WHERE page_url = '/'
+                    GROUP BY funnel_date
+
+                    UNION ALL
+
+                    SELECT
+                        funnel_date,
+                        'visit_products' AS funnel_step,
+                        2 AS step_order,
+                        COUNT(DISTINCT session_id) AS users_count
+                    FROM pv
+                    WHERE page_url = '/products'
                     GROUP BY funnel_date
 
                     UNION ALL
@@ -57,9 +159,9 @@ def main() -> int:
                     SELECT
                         funnel_date,
                         'product_view' AS funnel_step,
-                        2 AS step_order,
-                        COUNT(DISTINCT visitor_id) AS users_count
-                    FROM base
+                        3 AS step_order,
+                        COUNT(DISTINCT session_id) AS users_count
+                    FROM pv
                     WHERE page_url LIKE '/products/%'
                     GROUP BY funnel_date
 
@@ -68,22 +170,43 @@ def main() -> int:
                     SELECT
                         CAST(event_timestamp AS date) AS funnel_date,
                         'add_to_cart' AS funnel_step,
-                        3 AS step_order,
-                        COUNT(DISTINCT COALESCE(user_id, session_id)) AS users_count
+                        4 AS step_order,
+                        COUNT(DISTINCT session_id) AS users_count
                     FROM silver.product_interactions
                     WHERE interaction_type = 'add_to_cart'
+                      AND event_timestamp >= :since_date
                     GROUP BY CAST(event_timestamp AS date)
+
+                    UNION ALL
+
+                    SELECT
+                        funnel_date,
+                        'checkout_started' AS funnel_step,
+                        5 AS step_order,
+                        COUNT(DISTINCT session_id) AS users_count
+                    FROM checkout_events
+                    GROUP BY funnel_date
 
                     UNION ALL
 
                     SELECT
                         CAST(updated_at AS date) AS funnel_date,
                         'purchase' AS funnel_step,
-                        4 AS step_order,
-                        COUNT(DISTINCT COALESCE(user_id, correlation_id, order_id)) AS users_count
+                        6 AS step_order,
+                        COUNT(DISTINCT COALESCE(correlation_id, order_id)) AS users_count
                     FROM silver.orders
                     WHERE status = 'paid'
+                      AND updated_at >= :since_date
                     GROUP BY CAST(updated_at AS date)
+                ),
+                with_prev AS (
+                    SELECT
+                        funnel_date,
+                        funnel_step,
+                        step_order,
+                        users_count,
+                        LAG(users_count) OVER (PARTITION BY funnel_date ORDER BY step_order) AS prev_users_count
+                    FROM steps
                 ),
                 with_drop AS (
                     SELECT
@@ -92,15 +215,20 @@ def main() -> int:
                         step_order,
                         users_count,
                         CASE
-                            WHEN LAG(users_count) OVER (PARTITION BY funnel_date ORDER BY step_order) IS NULL THEN NULL
-                            WHEN LAG(users_count) OVER (PARTITION BY funnel_date ORDER BY step_order) = 0 THEN NULL
-                            ELSE CAST(
-                                1 - CAST(users_count AS decimal(10,4)) /
-                                    CAST(LAG(users_count) OVER (PARTITION BY funnel_date ORDER BY step_order) AS decimal(10,4))
-                                AS decimal(5,4)
-                            )
+                            WHEN prev_users_count IS NULL THEN NULL
+                            WHEN prev_users_count = 0 THEN NULL
+                            WHEN d.raw_drop_off_rate < 0 THEN CAST(0 AS decimal(9,6))
+                            WHEN d.raw_drop_off_rate > 1 THEN CAST(1 AS decimal(9,6))
+                            ELSE CAST(d.raw_drop_off_rate AS decimal(9,6))
                         END AS drop_off_rate
-                    FROM steps
+                    FROM with_prev
+                    OUTER APPLY (
+                        SELECT CAST(
+                            (CAST(prev_users_count AS decimal(18,6)) - CAST(users_count AS decimal(18,6)))
+                            / NULLIF(CAST(prev_users_count AS decimal(18,6)), 0)
+                            AS decimal(18,6)
+                        ) AS raw_drop_off_rate
+                    ) d
                 )
                 MERGE gold.conversion_funnel AS tgt
                 USING with_drop AS src
@@ -114,6 +242,187 @@ def main() -> int:
                     INSERT (funnel_date, funnel_step, step_order, users_count, drop_off_rate)
                     VALUES (src.funnel_date, src.funnel_step, src.step_order, src.users_count, src.drop_off_rate);
                 """,
+                {"since_date": since_date},
+            )
+
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text("DELETE FROM gold.behavior_daily WHERE metric_date >= :since_date;"),
+                    {"since_date": since_date},
+                )
+            )
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text(
+                        """
+                        ;WITH we AS (
+                            SELECT
+                                CAST(event_timestamp AS date) AS metric_date,
+                                COUNT(DISTINCT session_id) AS sessions,
+                                COUNT(DISTINCT CASE WHEN user_id IS NULL THEN NULL ELSE user_id END) AS unique_users,
+                                SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS page_views,
+                                SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END) AS clicks,
+                                SUM(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_cart,
+                                SUM(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS begin_checkout
+                            FROM silver.web_events
+                            WHERE event_timestamp >= :since_date
+                            GROUP BY CAST(event_timestamp AS date)
+                        ),
+                        p AS (
+                            SELECT
+                                event_date AS metric_date,
+                                COUNT(DISTINCT order_id) AS purchases
+                            FROM silver.purchases
+                            WHERE event_timestamp >= :since_date
+                            GROUP BY event_date
+                        ),
+                        merged AS (
+                            SELECT
+                                COALESCE(we.metric_date, p.metric_date) AS metric_date,
+                                ISNULL(we.sessions, 0) AS sessions,
+                                ISNULL(we.unique_users, 0) AS unique_users,
+                                ISNULL(we.page_views, 0) AS page_views,
+                                ISNULL(we.clicks, 0) AS clicks,
+                                ISNULL(we.add_to_cart, 0) AS add_to_cart,
+                                ISNULL(we.begin_checkout, 0) AS begin_checkout,
+                                ISNULL(p.purchases, 0) AS purchases
+                            FROM we
+                            FULL OUTER JOIN p
+                                ON we.metric_date = p.metric_date
+                        )
+                        INSERT INTO gold.behavior_daily
+                            (metric_date, sessions, unique_users, page_views, clicks, add_to_cart, begin_checkout, purchases)
+                        SELECT
+                            metric_date, sessions, unique_users, page_views, clicks, add_to_cart, begin_checkout, purchases
+                        FROM merged
+                        WHERE metric_date >= :since_date;
+                        """
+                    ),
+                    {"since_date": since_date},
+                )
+            )
+
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text("DELETE FROM gold.funnel_daily WHERE metric_date >= :since_date;"),
+                    {"since_date": since_date},
+                )
+            )
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text(
+                        """
+                        ;WITH session_flags AS (
+                            SELECT
+                                CAST(event_timestamp AS date) AS metric_date,
+                                session_id,
+                                MAX(CASE WHEN event_type = 'page_view' AND product_id IS NOT NULL THEN 1 ELSE 0 END) AS has_view,
+                                MAX(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS has_cart,
+                                MAX(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS has_checkout
+                            FROM silver.web_events
+                            WHERE event_timestamp >= :since_date
+                            GROUP BY CAST(event_timestamp AS date), session_id
+                        ),
+                        session_counts AS (
+                            SELECT
+                                metric_date,
+                                COUNT(DISTINCT CASE WHEN has_view = 1 THEN session_id END) AS view_sessions,
+                                COUNT(DISTINCT CASE WHEN has_cart = 1 THEN session_id END) AS cart_sessions,
+                                COUNT(DISTINCT CASE WHEN has_checkout = 1 THEN session_id END) AS checkout_sessions
+                            FROM session_flags
+                            GROUP BY metric_date
+                        ),
+                        session_start AS (
+                            SELECT
+                                CAST(event_timestamp AS date) AS metric_date,
+                                session_id,
+                                MAX(user_id) AS user_id,
+                                MIN(event_timestamp) AS session_start_ts
+                            FROM silver.web_events
+                            WHERE event_timestamp >= :since_date
+                            GROUP BY CAST(event_timestamp AS date), session_id
+                        ),
+                        purchase_base AS (
+                            SELECT
+                                event_timestamp,
+                                event_date AS metric_date,
+                                order_id,
+                                user_id,
+                                correlation_id
+                            FROM silver.purchases
+                            WHERE event_timestamp >= :since_date
+                        ),
+                        purchase_mapped AS (
+                            SELECT
+                                p.metric_date,
+                                p.order_id,
+                                p.user_id,
+                                COALESCE(sid.session_id, suser.session_id) AS mapped_session_id
+                            FROM purchase_base p
+                            OUTER APPLY (
+                                SELECT TOP 1 s.session_id
+                                FROM session_start s
+                                WHERE s.metric_date = p.metric_date
+                                  AND p.correlation_id IS NOT NULL
+                                  AND s.session_id = p.correlation_id
+                            ) sid
+                            OUTER APPLY (
+                                SELECT TOP 1 s.session_id
+                                FROM session_start s
+                                WHERE s.metric_date = p.metric_date
+                                  AND sid.session_id IS NULL
+                                  AND p.user_id IS NOT NULL
+                                  AND s.user_id = p.user_id
+                                ORDER BY ABS(DATEDIFF(SECOND, s.session_start_ts, p.event_timestamp))
+                            ) suser
+                        ),
+                        purchase_session_counts AS (
+                            SELECT
+                                metric_date,
+                                COUNT(DISTINCT mapped_session_id) AS purchase_sessions_assigned,
+                                COUNT(DISTINCT CASE WHEN user_id IS NULL THEN NULL ELSE user_id END) AS purchase_users
+                            FROM purchase_mapped
+                            GROUP BY metric_date
+                        ),
+                        merged AS (
+                            SELECT
+                                COALESCE(sc.metric_date, psc.metric_date) AS metric_date,
+                                ISNULL(sc.view_sessions, 0) AS view_sessions,
+                                ISNULL(sc.cart_sessions, 0) AS cart_sessions,
+                                ISNULL(sc.checkout_sessions, 0) AS checkout_sessions,
+                                CASE
+                                    WHEN ISNULL(psc.purchase_sessions_assigned, 0) > 0 THEN ISNULL(psc.purchase_sessions_assigned, 0)
+                                    ELSE ISNULL(psc.purchase_users, 0)
+                                END AS purchase_sessions
+                            FROM session_counts sc
+                            FULL OUTER JOIN purchase_session_counts psc
+                                ON sc.metric_date = psc.metric_date
+                        ),
+                        with_rates AS (
+                            SELECT
+                                metric_date,
+                                view_sessions,
+                                cart_sessions,
+                                checkout_sessions,
+                                purchase_sessions,
+                                CASE WHEN view_sessions = 0 THEN 0.0 ELSE CAST(cart_sessions AS float) / CAST(view_sessions AS float) END AS view_to_cart_rate,
+                                CASE WHEN cart_sessions = 0 THEN 0.0 ELSE CAST(checkout_sessions AS float) / CAST(cart_sessions AS float) END AS cart_to_checkout_rate,
+                                CASE WHEN checkout_sessions = 0 THEN 0.0 ELSE CAST(purchase_sessions AS float) / CAST(checkout_sessions AS float) END AS checkout_to_purchase_rate,
+                                CASE WHEN view_sessions = 0 THEN 0.0 ELSE CAST(purchase_sessions AS float) / CAST(view_sessions AS float) END AS view_to_purchase_rate
+                            FROM merged
+                        )
+                        INSERT INTO gold.funnel_daily
+                            (metric_date, view_sessions, cart_sessions, checkout_sessions, purchase_sessions,
+                             view_to_cart_rate, cart_to_checkout_rate, checkout_to_purchase_rate, view_to_purchase_rate)
+                        SELECT
+                            metric_date, view_sessions, cart_sessions, checkout_sessions, purchase_sessions,
+                            view_to_cart_rate, cart_to_checkout_rate, checkout_to_purchase_rate, view_to_purchase_rate
+                        FROM with_rates
+                        WHERE metric_date >= :since_date;
+                        """
+                    ),
+                    {"since_date": since_date},
+                )
             )
 
             rows_inserted += _safe_rowcount(
