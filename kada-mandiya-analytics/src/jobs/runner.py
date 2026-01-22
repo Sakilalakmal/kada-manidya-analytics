@@ -11,6 +11,7 @@ from src.config import load_settings
 from src.db.engine import get_engine
 from src.jobs.locking import LockNotAcquired, db_lock
 from src.jobs.pipeline import run_pipeline
+from src.ops.run_logger import fail_stale_running_runs
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
@@ -25,8 +26,19 @@ TRANSIENT_DB_EXC = (OperationalError, DBAPIError)
     wait=wait_fixed(2),
     reraise=True,
 )
-def _run_pipeline(include_seed: bool) -> None:
-    run_pipeline(run_type="pipeline_once", include_seed=include_seed)
+def _run_pipeline(*, run_type: str, include_seed: bool) -> None:
+    run_pipeline(run_type=run_type, include_seed=include_seed)
+
+
+def _pipeline_run_type(*, include_seed: bool, enable_silver: bool, enable_gold: bool) -> str:
+    parts: list[str] = []
+    if include_seed:
+        parts.append("seed")
+    if enable_silver:
+        parts.append("silver")
+    if enable_gold:
+        parts.append("gold")
+    return "+".join(parts) if parts else "pipeline"
 
 
 def run_pipeline_once(*, include_seed: bool = True) -> dict[str, str]:
@@ -42,21 +54,18 @@ def run_pipeline_once(*, include_seed: bool = True) -> dict[str, str]:
         )
         return {"status": "skipped"}
 
-    parts: list[str] = []
-    if include_seed:
-        parts.append("seed")
-    if enable_silver:
-        parts.append("silver")
-    if enable_gold:
-        parts.append("gold")
-    run_label = "+".join(parts) if parts else "pipeline"
+    run_label = _pipeline_run_type(
+        include_seed=include_seed, enable_silver=enable_silver, enable_gold=enable_gold
+    )
+
+    fail_stale_running_runs(older_than_minutes=10)
 
     with engine.connect() as conn:
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         try:
             with db_lock(conn):
                 try:
-                    _run_pipeline(include_seed=include_seed)
+                    _run_pipeline(run_type=run_label, include_seed=include_seed)
                     return {"status": "success"}
                 except Exception as exc:
                     logger.error("ETL failed: {}", exc)
