@@ -95,6 +95,7 @@ def _safe_rowcount(result) -> int:
 def main() -> int:
     settings = load_settings()
     engine = get_engine(settings)
+    show_seed_data = bool(getattr(settings, "show_seed_data", False))
 
     with engine.begin() as conn:
         run = start_run(conn, "build_gold")
@@ -108,13 +109,26 @@ def main() -> int:
             _exec_params(
                 conn,
                 """
-                ;WITH pv AS (
+                ;WITH seed_orders AS (
+                    SELECT DISTINCT
+                        COALESCE(
+                            be.entity_id,
+                            JSON_VALUE(be.payload, '$.order_id'),
+                            JSON_VALUE(be.payload, '$.data.order_id'),
+                            JSON_VALUE(be.payload, '$.order.order_id')
+                        ) AS order_id
+                    FROM bronze.business_events be
+                    WHERE be.event_timestamp >= :since_date
+                      AND be.payload LIKE '%seed_run_id%'
+                ),
+                pv AS (
                     SELECT
                         CAST(event_timestamp AS date) AS funnel_date,
                         session_id,
                         page_url
                     FROM bronze.page_view_events
                     WHERE event_timestamp >= :since_date
+                      AND (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
                 ),
                 checkout_events AS (
                     SELECT
@@ -123,6 +137,7 @@ def main() -> int:
                     FROM bronze.page_view_events
                     WHERE event_timestamp >= :since_date
                       AND page_url = '/checkout'
+                      AND (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
 
                     UNION
 
@@ -132,6 +147,7 @@ def main() -> int:
                     FROM bronze.click_events
                     WHERE event_timestamp >= :since_date
                       AND element_id = 'btn_checkout'
+                      AND (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
                 ),
                 steps AS (
                     SELECT
@@ -175,6 +191,7 @@ def main() -> int:
                     FROM silver.product_interactions
                     WHERE interaction_type = 'add_to_cart'
                       AND event_timestamp >= :since_date
+                      AND (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
                     GROUP BY CAST(event_timestamp AS date)
 
                     UNION ALL
@@ -194,9 +211,10 @@ def main() -> int:
                         'purchase' AS funnel_step,
                         6 AS step_order,
                         COUNT(DISTINCT COALESCE(correlation_id, order_id)) AS users_count
-                    FROM silver.orders
-                    WHERE status = 'paid'
-                      AND updated_at >= :since_date
+                    FROM silver.orders o
+                    WHERE o.status = 'paid'
+                      AND o.updated_at >= :since_date
+                      AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = o.order_id))
                     GROUP BY CAST(updated_at AS date)
                 ),
                 with_prev AS (
@@ -242,7 +260,7 @@ def main() -> int:
                     INSERT (funnel_date, funnel_step, step_order, users_count, drop_off_rate)
                     VALUES (src.funnel_date, src.funnel_step, src.step_order, src.users_count, src.drop_off_rate);
                 """,
-                {"since_date": since_date},
+                {"since_date": since_date, "show_seed_data": 1 if show_seed_data else 0},
             )
 
             rows_inserted += _safe_rowcount(
@@ -255,7 +273,19 @@ def main() -> int:
                 conn.execute(
                     text(
                         """
-                        ;WITH we AS (
+                        ;WITH seed_orders AS (
+                            SELECT DISTINCT
+                                COALESCE(
+                                    be.entity_id,
+                                    JSON_VALUE(be.payload, '$.order_id'),
+                                    JSON_VALUE(be.payload, '$.data.order_id'),
+                                    JSON_VALUE(be.payload, '$.order.order_id')
+                                ) AS order_id
+                            FROM bronze.business_events be
+                            WHERE be.event_timestamp >= :since_date
+                              AND be.payload LIKE '%seed_run_id%'
+                        ),
+                        we AS (
                             SELECT
                                 CAST(event_timestamp AS date) AS metric_date,
                                 COUNT(DISTINCT session_id) AS sessions,
@@ -266,6 +296,7 @@ def main() -> int:
                                 SUM(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS begin_checkout
                             FROM silver.web_events
                             WHERE event_timestamp >= :since_date
+                              AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
                             GROUP BY CAST(event_timestamp AS date)
                         ),
                         p AS (
@@ -274,6 +305,7 @@ def main() -> int:
                                 COUNT(DISTINCT order_id) AS purchases
                             FROM silver.purchases
                             WHERE event_timestamp >= :since_date
+                              AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = silver.purchases.order_id))
                             GROUP BY event_date
                         ),
                         merged AS (
@@ -298,7 +330,7 @@ def main() -> int:
                         WHERE metric_date >= :since_date;
                         """
                     ),
-                    {"since_date": since_date},
+                    {"since_date": since_date, "show_seed_data": 1 if show_seed_data else 0},
                 )
             )
 
@@ -312,7 +344,19 @@ def main() -> int:
                 conn.execute(
                     text(
                         """
-                        ;WITH session_flags AS (
+                        ;WITH seed_orders AS (
+                            SELECT DISTINCT
+                                COALESCE(
+                                    be.entity_id,
+                                    JSON_VALUE(be.payload, '$.order_id'),
+                                    JSON_VALUE(be.payload, '$.data.order_id'),
+                                    JSON_VALUE(be.payload, '$.order.order_id')
+                                ) AS order_id
+                            FROM bronze.business_events be
+                            WHERE be.event_timestamp >= :since_date
+                              AND be.payload LIKE '%seed_run_id%'
+                        ),
+                        session_flags AS (
                             SELECT
                                 CAST(event_timestamp AS date) AS metric_date,
                                 session_id,
@@ -321,6 +365,7 @@ def main() -> int:
                                 MAX(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS has_checkout
                             FROM silver.web_events
                             WHERE event_timestamp >= :since_date
+                              AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
                             GROUP BY CAST(event_timestamp AS date), session_id
                         ),
                         session_counts AS (
@@ -340,6 +385,7 @@ def main() -> int:
                                 MIN(event_timestamp) AS session_start_ts
                             FROM silver.web_events
                             WHERE event_timestamp >= :since_date
+                              AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
                             GROUP BY CAST(event_timestamp AS date), session_id
                         ),
                         purchase_base AS (
@@ -351,6 +397,7 @@ def main() -> int:
                                 correlation_id
                             FROM silver.purchases
                             WHERE event_timestamp >= :since_date
+                              AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = silver.purchases.order_id))
                         ),
                         purchase_mapped AS (
                             SELECT
@@ -421,7 +468,7 @@ def main() -> int:
                         WHERE metric_date >= :since_date;
                         """
                     ),
-                    {"since_date": since_date},
+                    {"since_date": since_date, "show_seed_data": 1 if show_seed_data else 0},
                 )
             )
 
@@ -444,7 +491,20 @@ def main() -> int:
                         SUM(CASE WHEN interaction_type = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_cart_count
                     FROM silver.product_interactions
                     WHERE event_timestamp >= :since_date
+                      AND (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
                     GROUP BY CAST(event_timestamp AS date), product_id
+                ),
+                seed_orders AS (
+                    SELECT DISTINCT
+                        COALESCE(
+                            be.entity_id,
+                            JSON_VALUE(be.payload, '$.order_id'),
+                            JSON_VALUE(be.payload, '$.data.order_id'),
+                            JSON_VALUE(be.payload, '$.order.order_id')
+                        ) AS order_id
+                    FROM bronze.business_events be
+                    WHERE be.event_timestamp >= :since_date
+                      AND be.payload LIKE '%seed_run_id%'
                 ),
                 purchases AS (
                     SELECT
@@ -455,6 +515,7 @@ def main() -> int:
                     FROM silver.order_items oi
                     INNER JOIN silver.orders o ON oi.order_id = o.order_id
                     WHERE o.status = 'paid' AND o.updated_at >= :since_date
+                      AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = o.order_id))
                     GROUP BY CAST(o.updated_at AS date), oi.product_id
                 ),
                 reviews AS (
@@ -487,13 +548,41 @@ def main() -> int:
                         ISNULL(r.reviews_count, 0) AS reviews_count,
                         CASE
                             WHEN ISNULL(i.views_count, 0) = 0 THEN NULL
-                            ELSE CAST(ISNULL(i.add_to_cart_count, 0) AS decimal(10,4))
-                                / CAST(i.views_count AS decimal(10,4))
+                            ELSE
+                                CASE
+                                    WHEN (
+                                        CAST(ISNULL(i.add_to_cart_count, 0) AS decimal(18,6))
+                                        / NULLIF(CAST(i.views_count AS decimal(18,6)), 0)
+                                    ) < 0 THEN CAST(0 AS decimal(9,6))
+                                    WHEN (
+                                        CAST(ISNULL(i.add_to_cart_count, 0) AS decimal(18,6))
+                                        / NULLIF(CAST(i.views_count AS decimal(18,6)), 0)
+                                    ) > 1 THEN CAST(1 AS decimal(9,6))
+                                    ELSE CAST(
+                                        CAST(ISNULL(i.add_to_cart_count, 0) AS decimal(18,6))
+                                        / NULLIF(CAST(i.views_count AS decimal(18,6)), 0)
+                                        AS decimal(9,6)
+                                    )
+                                END
                         END AS view_to_cart_rate,
                         CASE
                             WHEN ISNULL(i.add_to_cart_count, 0) = 0 THEN NULL
-                            ELSE CAST(ISNULL(p.purchases_count, 0) AS decimal(10,4))
-                                / CAST(i.add_to_cart_count AS decimal(10,4))
+                            ELSE
+                                CASE
+                                    WHEN (
+                                        CAST(ISNULL(p.purchases_count, 0) AS decimal(18,6))
+                                        / NULLIF(CAST(i.add_to_cart_count AS decimal(18,6)), 0)
+                                    ) < 0 THEN CAST(0 AS decimal(9,6))
+                                    WHEN (
+                                        CAST(ISNULL(p.purchases_count, 0) AS decimal(18,6))
+                                        / NULLIF(CAST(i.add_to_cart_count AS decimal(18,6)), 0)
+                                    ) > 1 THEN CAST(1 AS decimal(9,6))
+                                    ELSE CAST(
+                                        CAST(ISNULL(p.purchases_count, 0) AS decimal(18,6))
+                                        / NULLIF(CAST(i.add_to_cart_count AS decimal(18,6)), 0)
+                                        AS decimal(9,6)
+                                    )
+                                END
                         END AS cart_to_purchase_rate
                     FROM keys k
                     LEFT JOIN interactions i
@@ -515,7 +604,7 @@ def main() -> int:
                 WHERE metric_date >= :since_date;
                             """
                     ),
-                    {"since_date": since_date},
+                    {"since_date": since_date, "show_seed_data": 1 if show_seed_data else 0},
                 )
             )
 
@@ -568,6 +657,7 @@ def main() -> int:
                         payload
                     FROM bronze.business_events
                     WHERE event_timestamp >= :since_date
+                      AND (:show_seed_data = 1 OR payload NOT LIKE '%seed_run_id%')
                 ),
                 normalized AS (
                     SELECT
@@ -626,11 +716,11 @@ def main() -> int:
                 WHERE metric_date >= :since_date;
                             """
                     ),
-                    {"since_date": since_date},
+                    {"since_date": since_date, "show_seed_data": 1 if show_seed_data else 0},
                 )
             )
 
-            _exec(
+            _exec_params(
                 conn,
                 """
                 ;WITH pv AS (
@@ -641,6 +731,7 @@ def main() -> int:
                         COUNT(DISTINCT COALESCE(user_id, session_id)) AS unique_visitors,
                         AVG(TRY_CONVERT(decimal(10,2), JSON_VALUE(properties, '$.load_time_ms'))) AS avg_load_time_ms
                     FROM bronze.page_view_events
+                    WHERE (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
                     GROUP BY CAST(event_timestamp AS date), page_url
                 ),
                 time_on_page AS (
@@ -650,6 +741,7 @@ def main() -> int:
                         AVG(CAST(time_on_prev_page_seconds AS decimal(10,2))) AS avg_time_on_page_seconds
                     FROM bronze.page_view_events
                     WHERE referrer_url IS NOT NULL AND time_on_prev_page_seconds IS NOT NULL
+                      AND (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
                     GROUP BY CAST(event_timestamp AS date), referrer_url
                 ),
                 scroll AS (
@@ -659,11 +751,25 @@ def main() -> int:
                         AVG(scroll_depth_pct) AS avg_scroll_depth
                     FROM bronze.scroll_events
                     WHERE scroll_depth_pct IS NOT NULL
+                      AND (:show_seed_data = 1 OR COALESCE(properties, '') NOT LIKE '%seed_run_id%')
                     GROUP BY CAST(event_timestamp AS date), page_url
+                ),
+                seed_sessions AS (
+                    SELECT DISTINCT
+                        CAST(event_timestamp AS date) AS metric_date,
+                        session_id
+                    FROM silver.web_events
+                    WHERE COALESCE(properties_json, '') LIKE '%seed_run_id%'
                 ),
                 seq_max AS (
                     SELECT session_id, MAX(step_number) AS max_step
                     FROM silver.page_sequence
+                    WHERE (:show_seed_data = 1 OR NOT EXISTS (
+                        SELECT 1
+                        FROM seed_sessions ss
+                        WHERE ss.metric_date = CAST(silver.page_sequence.event_timestamp AS date)
+                          AND ss.session_id = silver.page_sequence.session_id
+                    ))
                     GROUP BY session_id
                 ),
                 entry AS (
@@ -675,6 +781,12 @@ def main() -> int:
                     FROM silver.page_sequence ps
                     INNER JOIN seq_max mx ON ps.session_id = mx.session_id
                     WHERE ps.step_number = 1
+                      AND (:show_seed_data = 1 OR NOT EXISTS (
+                          SELECT 1
+                          FROM seed_sessions ss
+                          WHERE ss.metric_date = CAST(ps.event_timestamp AS date)
+                            AND ss.session_id = ps.session_id
+                      ))
                     GROUP BY CAST(ps.event_timestamp AS date), ps.page_url
                 ),
                 exitp AS (
@@ -685,6 +797,12 @@ def main() -> int:
                     FROM silver.page_sequence ps
                     INNER JOIN seq_max mx
                         ON ps.session_id = mx.session_id AND ps.step_number = mx.max_step
+                    WHERE (:show_seed_data = 1 OR NOT EXISTS (
+                        SELECT 1
+                        FROM seed_sessions ss
+                        WHERE ss.metric_date = CAST(ps.event_timestamp AS date)
+                          AND ss.session_id = ps.session_id
+                    ))
                     GROUP BY CAST(ps.event_timestamp AS date), ps.page_url
                 ),
                 sessions_viewed AS (
@@ -693,6 +811,12 @@ def main() -> int:
                         page_url,
                         COUNT(DISTINCT session_id) AS sessions_viewed
                     FROM silver.page_sequence
+                    WHERE (:show_seed_data = 1 OR NOT EXISTS (
+                        SELECT 1
+                        FROM seed_sessions ss
+                        WHERE ss.metric_date = CAST(silver.page_sequence.event_timestamp AS date)
+                          AND ss.session_id = silver.page_sequence.session_id
+                    ))
                     GROUP BY CAST(event_timestamp AS date), page_url
                 ),
                 merged AS (
@@ -748,6 +872,7 @@ def main() -> int:
                         src.avg_scroll_depth, src.bounce_rate, src.exit_rate, TRY_CONVERT(int, src.avg_load_time_ms)
                     );
                 """,
+                {"show_seed_data": 1 if show_seed_data else 0},
             )
 
             _exec(
@@ -830,7 +955,7 @@ def main() -> int:
                 """,
             )
 
-            _exec(
+            _exec_params(
                 conn,
                 """
                 ;WITH n AS (
@@ -839,17 +964,31 @@ def main() -> int:
                         DATEADD(MINUTE, -5, SYSDATETIME()) AS since_5m,
                         CAST(SYSDATETIME() AS date) AS today
                 ),
+                seed_orders AS (
+                    SELECT DISTINCT
+                        COALESCE(
+                            be.entity_id,
+                            JSON_VALUE(be.payload, '$.order_id'),
+                            JSON_VALUE(be.payload, '$.data.order_id'),
+                            JSON_VALUE(be.payload, '$.order.order_id')
+                        ) AS order_id
+                    FROM bronze.business_events be
+                    WHERE be.event_timestamp >= DATEADD(day, -7, SYSDATETIME())
+                      AND be.payload LIKE '%seed_run_id%'
+                ),
                 active AS (
                     SELECT COUNT(DISTINCT COALESCE(pv.user_id, pv.session_id)) AS active_users_now
                     FROM bronze.page_view_events pv
                     CROSS JOIN n
                     WHERE pv.event_timestamp >= n.since_5m
+                      AND (:show_seed_data = 1 OR COALESCE(pv.properties, '') NOT LIKE '%seed_run_id%')
                 ),
                 sessions_today AS (
                     SELECT COUNT(DISTINCT pv.session_id) AS sessions_today
                     FROM bronze.page_view_events pv
                     CROSS JOIN n
                     WHERE CAST(pv.event_timestamp AS date) = n.today
+                      AND (:show_seed_data = 1 OR COALESCE(pv.properties, '') NOT LIKE '%seed_run_id%')
                 ),
                 orders_today AS (
                     SELECT
@@ -858,6 +997,7 @@ def main() -> int:
                     FROM silver.orders o
                     CROSS JOIN n
                     WHERE o.status = 'paid' AND CAST(o.updated_at AS date) = n.today
+                      AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = o.order_id))
                 ),
                 top_product AS (
                     SELECT TOP 1
@@ -866,6 +1006,7 @@ def main() -> int:
                     INNER JOIN silver.orders o ON oi.order_id = o.order_id
                     CROSS JOIN n
                     WHERE o.status = 'paid' AND CAST(o.updated_at AS date) = n.today
+                      AND (:show_seed_data = 1 OR NOT EXISTS (SELECT 1 FROM seed_orders so WHERE so.order_id = o.order_id))
                     GROUP BY oi.product_id
                     ORDER BY SUM(COALESCE(oi.line_total, oi.unit_price * oi.quantity, 0)) DESC
                 ),
@@ -874,6 +1015,7 @@ def main() -> int:
                     FROM bronze.page_view_events pv
                     CROSS JOIN n
                     WHERE CAST(pv.event_timestamp AS date) = n.today
+                      AND (:show_seed_data = 1 OR COALESCE(pv.properties, '') NOT LIKE '%seed_run_id%')
                     GROUP BY page_url
                     ORDER BY COUNT(*) DESC
                 ),
@@ -928,6 +1070,7 @@ def main() -> int:
                         src.top_product_id, src.top_page_url, src.avg_latency_ms, src.error_rate_percent
                     );
                 """,
+                {"show_seed_data": 1 if show_seed_data else 0},
             )
 
             finish_run(conn, run, rows_inserted=rows_inserted)

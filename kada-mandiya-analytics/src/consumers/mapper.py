@@ -97,6 +97,20 @@ def _best_effort_service(payload: Any) -> str:
     return (svc or "unknown")[:64]
 
 
+def _infer_service_from_key(event_type: str, routing_key: str) -> str | None:
+    for raw in [event_type, routing_key]:
+        s = str(raw or "").strip().lower()
+        if not s:
+            continue
+        if s.startswith("order.") or s.startswith("order_") or s == "order":
+            return "order-service"
+        if s.startswith("payment.") or s.startswith("payment_") or s == "payment":
+            return "payment-service"
+        if s.startswith("review.") or s.startswith("review_") or s == "review":
+            return "review-service"
+    return None
+
+
 def _best_effort_event_type(payload: Any, routing_key: str) -> str:
     dcts = _candidate_dicts(payload)
     et = _first_nonempty_str(
@@ -183,6 +197,9 @@ def normalize_to_business_event(
 ) -> BusinessEvent:
     event_type = _best_effort_event_type(payload_obj, routing_key)
     service = _best_effort_service(payload_obj)
+    inferred = _infer_service_from_key(event_type, routing_key)
+    if (not service) or service == "unknown":
+        service = inferred or "unknown"
     correlation_id = _best_effort_correlation_id(payload_obj, message_correlation_id)
     user_id = _best_effort_user_id(payload_obj)
     entity_id = _best_effort_entity_id(payload_obj)
