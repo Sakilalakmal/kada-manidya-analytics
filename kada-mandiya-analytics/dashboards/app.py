@@ -203,7 +203,7 @@ def product():
         SELECT TOP 5
             product_id,
             SUM(CAST(revenue AS float)) AS revenue
-        FROM gold.product_metrics
+        FROM gold.product_daily
         WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
         GROUP BY product_id
         ORDER BY revenue DESC;
@@ -214,7 +214,7 @@ def product():
         SELECT TOP 5
             product_id,
             SUM(CAST(purchases_count AS float)) AS purchases_count
-        FROM gold.product_metrics
+        FROM gold.product_daily
         WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
         GROUP BY product_id
         ORDER BY purchases_count DESC;
@@ -226,7 +226,7 @@ def product():
         st.subheader("Top 5 Products by Revenue (30d)")
         if top_rev.empty:
             st.info("No data available yet.")
-            latest = _latest_date("gold.product_metrics", "metric_date")
+            latest = _latest_date("gold.product_daily", "metric_date")
             if latest:
                 st.caption(f"Latest available date: {latest}")
         else:
@@ -239,7 +239,7 @@ def product():
         st.subheader("Top 5 Products by Purchases (30d)")
         if top_purchases.empty:
             st.info("No data available yet.")
-            latest = _latest_date("gold.product_metrics", "metric_date")
+            latest = _latest_date("gold.product_daily", "metric_date")
             if latest:
                 st.caption(f"Latest available date: {latest}")
         else:
@@ -258,10 +258,12 @@ def product():
         """
         SELECT
             product_id,
-            AVG(CAST(avg_rating AS float)) AS avg_rating_30d,
-            SUM(CAST(total_reviews AS int)) AS total_reviews_30d,
-            SUM(CAST(five_star_reviews AS int)) AS five_star_reviews_30d
-        FROM gold.reviews_quality
+            CASE
+                WHEN SUM(CAST(reviews_count AS float)) = 0 THEN NULL
+                ELSE SUM(CAST(avg_rating AS float) * CAST(reviews_count AS float)) / NULLIF(SUM(CAST(reviews_count AS float)), 0)
+            END AS avg_rating_30d,
+            SUM(CAST(reviews_count AS int)) AS total_reviews_30d
+        FROM gold.product_daily
         WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
         GROUP BY product_id
         ORDER BY total_reviews_30d DESC;
@@ -269,7 +271,7 @@ def product():
     )
     if reviews.empty:
         st.info("No data available yet.")
-        latest = _latest_date("gold.reviews_quality", "metric_date")
+        latest = _latest_date("gold.product_daily", "metric_date")
         if latest:
             st.caption(f"Latest available date: {latest}")
     else:
@@ -280,9 +282,6 @@ def product():
         reviews_display["total_reviews_30d"] = reviews_display["total_reviews_30d"].map(
             _fmt_int
         )
-        reviews_display["five_star_reviews_30d"] = reviews_display[
-            "five_star_reviews_30d"
-        ].map(_fmt_int)
         st.dataframe(reviews_display, use_container_width=True, hide_index=True)
 
         top10 = reviews.head(10).copy()

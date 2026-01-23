@@ -103,7 +103,7 @@ def main() -> int:
                     CONSTRAINT DF_bronze_page_view_events_event_id DEFAULT NEWID()
                     CONSTRAINT PK_bronze_page_view_events PRIMARY KEY,
                 event_timestamp datetime2 NOT NULL,
-                session_id varchar(64) NOT NULL,
+                session_id varchar(64) NULL,
                 user_id varchar(64) NULL,
                 page_url varchar(2000) NOT NULL,
                 referrer_url varchar(2000) NULL,
@@ -111,7 +111,64 @@ def main() -> int:
                 utm_medium varchar(100) NULL,
                 utm_campaign varchar(100) NULL,
                 time_on_prev_page_seconds int NULL,
-                properties nvarchar(max) NULL
+                properties nvarchar(max) NULL,
+                payload nvarchar(max) NULL,
+                meta nvarchar(max) NULL
+            );
+        END
+        """)
+    statements.append("""
+        IF OBJECT_ID('bronze.cart_events', 'U') IS NULL
+        BEGIN
+            CREATE TABLE bronze.cart_events(
+                event_id uniqueidentifier NOT NULL
+                    CONSTRAINT DF_bronze_cart_events_event_id DEFAULT NEWID()
+                    CONSTRAINT PK_bronze_cart_events PRIMARY KEY,
+                event_timestamp datetime2 NOT NULL,
+                session_id varchar(64) NULL,
+                user_id varchar(64) NULL,
+                page_url varchar(2000) NULL,
+                product_id varchar(64) NULL,
+                quantity int NULL,
+                payload nvarchar(max) NOT NULL,
+                meta nvarchar(max) NULL
+            );
+        END
+        """)
+    statements.append("""
+        IF OBJECT_ID('bronze.checkout_events', 'U') IS NULL
+        BEGIN
+            CREATE TABLE bronze.checkout_events(
+                event_id uniqueidentifier NOT NULL
+                    CONSTRAINT DF_bronze_checkout_events_event_id DEFAULT NEWID()
+                    CONSTRAINT PK_bronze_checkout_events PRIMARY KEY,
+                event_timestamp datetime2 NOT NULL,
+                session_id varchar(64) NULL,
+                user_id varchar(64) NULL,
+                page_url varchar(2000) NULL,
+                order_id varchar(64) NULL,
+                payload nvarchar(max) NOT NULL,
+                meta nvarchar(max) NULL
+            );
+        END
+        """)
+    statements.append("""
+        IF OBJECT_ID('bronze.order_events', 'U') IS NULL
+        BEGIN
+            CREATE TABLE bronze.order_events(
+                event_id uniqueidentifier NOT NULL
+                    CONSTRAINT DF_bronze_order_events_event_id DEFAULT NEWID()
+                    CONSTRAINT PK_bronze_order_events PRIMARY KEY,
+                event_timestamp datetime2 NOT NULL,
+                session_id varchar(64) NULL,
+                user_id varchar(64) NULL,
+                order_id varchar(64) NULL,
+                payment_id varchar(64) NULL,
+                event_type varchar(64) NOT NULL,
+                total_amount decimal(12,2) NULL,
+                currency varchar(10) NULL,
+                payload nvarchar(max) NOT NULL,
+                meta nvarchar(max) NULL
             );
         END
         """)
@@ -184,6 +241,43 @@ def main() -> int:
                 entity_id varchar(64) NULL,
                 payload nvarchar(max) NOT NULL
             );
+        END
+        """)
+
+    # Schema upgrades (idempotent)
+    statements.append("""
+        IF OBJECT_ID('bronze.click_events', 'U') IS NOT NULL
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM sys.columns
+                WHERE object_id = OBJECT_ID('bronze.click_events')
+                  AND name = 'session_id'
+                  AND is_nullable = 0
+            )
+                ALTER TABLE bronze.click_events ALTER COLUMN session_id varchar(64) NULL;
+
+            IF COL_LENGTH('bronze.click_events', 'payload') IS NULL
+                ALTER TABLE bronze.click_events ADD payload nvarchar(max) NULL;
+            IF COL_LENGTH('bronze.click_events', 'meta') IS NULL
+                ALTER TABLE bronze.click_events ADD meta nvarchar(max) NULL;
+        END
+
+        IF OBJECT_ID('bronze.page_view_events', 'U') IS NOT NULL
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM sys.columns
+                WHERE object_id = OBJECT_ID('bronze.page_view_events')
+                  AND name = 'session_id'
+                  AND is_nullable = 0
+            )
+                ALTER TABLE bronze.page_view_events ALTER COLUMN session_id varchar(64) NULL;
+
+            IF COL_LENGTH('bronze.page_view_events', 'payload') IS NULL
+                ALTER TABLE bronze.page_view_events ADD payload nvarchar(max) NULL;
+            IF COL_LENGTH('bronze.page_view_events', 'meta') IS NULL
+                ALTER TABLE bronze.page_view_events ADD meta nvarchar(max) NULL;
         END
         """)
 
@@ -393,6 +487,20 @@ def main() -> int:
         END
         """)
     statements.append("""
+        IF OBJECT_ID('gold.product_daily', 'U') IS NULL
+        BEGIN
+            CREATE TABLE gold.product_daily(
+                product_id varchar(64) NOT NULL,
+                metric_date date NOT NULL,
+                purchases_count int NOT NULL,
+                revenue decimal(12,2) NOT NULL,
+                avg_rating decimal(5,2) NULL,
+                reviews_count int NOT NULL,
+                CONSTRAINT PK_gold_product_daily PRIMARY KEY (product_id, metric_date)
+            );
+        END
+        """)
+    statements.append("""
         IF OBJECT_ID('gold.page_performance', 'U') IS NULL
         BEGIN
             CREATE TABLE gold.page_performance(
@@ -492,6 +600,18 @@ def main() -> int:
         "IX_bronze_business_events_service_type_ts",
         "service, event_type, event_timestamp",
     )
+
+    for table in [
+        "bronze.cart_events",
+        "bronze.checkout_events",
+        "bronze.order_events",
+    ]:
+        ix(table, f"IX_{table.replace('.', '_')}_event_timestamp", "event_timestamp")
+        ix(table, f"IX_{table.replace('.', '_')}_session_id", "session_id", "session_id IS NOT NULL")
+        ix(table, f"IX_{table.replace('.', '_')}_user_id", "user_id", "user_id IS NOT NULL")
+
+    ix("bronze.cart_events", "IX_bronze_cart_events_product_id", "product_id", "product_id IS NOT NULL")
+    ix("bronze.order_events", "IX_bronze_order_events_order_id", "order_id", "order_id IS NOT NULL")
 
     ix("silver.orders", "IX_silver_orders_status_created_at", "status, created_at")
     ix("silver.order_items", "IX_silver_order_items_order_id", "order_id")
