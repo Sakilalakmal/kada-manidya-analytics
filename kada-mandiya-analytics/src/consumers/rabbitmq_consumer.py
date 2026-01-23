@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+from decimal import Decimal
 
 import aio_pika
 from aio_pika import ExchangeType, IncomingMessage
@@ -49,6 +51,49 @@ class RabbitMQConsumer:
         self._cfg = cfg
         self._engine = get_engine(load_settings())
 
+    @staticmethod
+    def _candidate_dicts(payload_obj) -> list[dict]:
+        if not isinstance(payload_obj, dict):
+            return []
+        out: list[dict] = [payload_obj]
+        for k in ["meta", "data", "payload", "event", "properties"]:
+            v = payload_obj.get(k)
+            if isinstance(v, dict):
+                out.append(v)
+        return out
+
+    @classmethod
+    def _first_nonempty(cls, payload_obj, keys: list[str]) -> str | None:
+        for d in cls._candidate_dicts(payload_obj):
+            for k in keys:
+                v = d.get(k)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    return s
+        return None
+
+    @classmethod
+    def _first_int(cls, payload_obj, keys: list[str]) -> int | None:
+        s = cls._first_nonempty(payload_obj, keys)
+        if s is None:
+            return None
+        try:
+            return int(float(s))
+        except Exception:
+            return None
+
+    @classmethod
+    def _first_decimal(cls, payload_obj, keys: list[str]) -> Decimal | None:
+        s = cls._first_nonempty(payload_obj, keys)
+        if s is None:
+            return None
+        try:
+            return Decimal(str(s))
+        except Exception:
+            return None
+
     @classmethod
     def from_env(cls) -> "RabbitMQConsumer":
         s = load_settings()
@@ -67,7 +112,15 @@ class RabbitMQConsumer:
                 exchange=cfg.exchange,
                 exchange_type=cfg.exchange_type,
                 queue=cfg.queue,
-                routing_keys=["order.*", "payment.*", "review.*"],
+                routing_keys=[
+                    "ui.page_view",
+                    "ui.click",
+                    "ui.add_to_cart",
+                    "ui.begin_checkout",
+                    "order.paid",
+                    "payment.succeeded",
+                    "review.*",
+                ],
                 prefetch=cfg.prefetch,
                 dlq=cfg.dlq,
             )
@@ -192,7 +245,16 @@ class RabbitMQConsumer:
             return "reject" if self._cfg.dlq else "ack"
 
         try:
-            inserted, rowcount = await asyncio.to_thread(self._insert_event_sync, fp, event)
+            inserted, rowcount = await asyncio.to_thread(
+                self._insert_event_sync,
+                fp,
+                routing_key,
+                message_id,
+                correlation_id,
+                raw_json,
+                payload_obj,
+                event,
+            )
         except Exception as exc:
             logger.error("db insert failed rk='{}': {}", routing_key, exc)
             await asyncio.to_thread(
@@ -216,7 +278,16 @@ class RabbitMQConsumer:
         return "ack"
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=0.5, min=0.5, max=10), reraise=True)
-    def _insert_event_sync(self, fingerprint: str, event) -> tuple[bool, int]:
+    def _insert_event_sync(
+        self,
+        fingerprint: str,
+        routing_key: str,
+        message_id: str | None,
+        correlation_id: str | None,
+        raw_json: str,
+        payload_obj,
+        event,
+    ) -> tuple[bool, int]:
         first_seen_at = to_sqlserver_utc_naive(utc_now())
         with self._engine.begin() as conn:
             claimed = claim_fingerprint_or_skip(
@@ -228,6 +299,137 @@ class RabbitMQConsumer:
             if not claimed:
                 return False, 0
 
+            rk = (routing_key or "").strip().lower()
+            ts = to_sqlserver_utc_naive(event.event_timestamp)
+
+            meta = {
+                "routing_key": routing_key,
+                "message_id": message_id,
+                "correlation_id": correlation_id,
+            }
+            meta_json = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+
+            if rk == "ui.page_view":
+                session_id = self._first_nonempty(payload_obj, ["session_id", "sessionId"]) or None
+                page_url = self._first_nonempty(payload_obj, ["page_url", "pageUrl", "url", "path"]) or "/"
+                props = raw_json
+                result = conn.execute(
+                    text(
+                        """
+                        INSERT INTO bronze.page_view_events
+                            (event_id, event_timestamp, session_id, user_id, page_url, referrer_url, utm_source, utm_medium, utm_campaign, time_on_prev_page_seconds, properties, payload, meta)
+                        VALUES
+                            (:event_id, :event_timestamp, :session_id, :user_id, :page_url, :referrer_url, :utm_source, :utm_medium, :utm_campaign, :time_on_prev_page_seconds, :properties, :payload, :meta);
+                        """
+                    ),
+                    {
+                        "event_id": str(event.event_id),
+                        "event_timestamp": ts,
+                        "session_id": session_id,
+                        "user_id": event.user_id,
+                        "page_url": page_url,
+                        "referrer_url": self._first_nonempty(payload_obj, ["referrer_url", "referrerUrl", "referrer"]) or None,
+                        "utm_source": self._first_nonempty(payload_obj, ["utm_source", "utmSource"]) or None,
+                        "utm_medium": self._first_nonempty(payload_obj, ["utm_medium", "utmMedium"]) or None,
+                        "utm_campaign": self._first_nonempty(payload_obj, ["utm_campaign", "utmCampaign"]) or None,
+                        "time_on_prev_page_seconds": self._first_int(payload_obj, ["time_on_prev_page_seconds", "timeOnPrevPageSeconds"]) or None,
+                        "properties": props,
+                        "payload": raw_json,
+                        "meta": meta_json,
+                    },
+                )
+                return True, int(getattr(result, "rowcount", 0) or 0)
+
+            if rk == "ui.click":
+                session_id = self._first_nonempty(payload_obj, ["session_id", "sessionId"]) or None
+                page_url = self._first_nonempty(payload_obj, ["page_url", "pageUrl", "url", "path"]) or "/"
+                element_id = self._first_nonempty(payload_obj, ["element_id", "elementId", "target_id", "targetId"]) or None
+                result = conn.execute(
+                    text(
+                        """
+                        INSERT INTO bronze.click_events
+                            (event_id, event_timestamp, session_id, user_id, page_url, element_id, x, y, viewport_w, viewport_h, user_agent, ip_address, properties, payload, meta)
+                        VALUES
+                            (:event_id, :event_timestamp, :session_id, :user_id, :page_url, :element_id, :x, :y, :viewport_w, :viewport_h, :user_agent, :ip_address, :properties, :payload, :meta);
+                        """
+                    ),
+                    {
+                        "event_id": str(event.event_id),
+                        "event_timestamp": ts,
+                        "session_id": session_id,
+                        "user_id": event.user_id,
+                        "page_url": page_url,
+                        "element_id": element_id,
+                        "x": self._first_int(payload_obj, ["x"]) or None,
+                        "y": self._first_int(payload_obj, ["y"]) or None,
+                        "viewport_w": self._first_int(payload_obj, ["viewport_w", "viewportW"]) or None,
+                        "viewport_h": self._first_int(payload_obj, ["viewport_h", "viewportH"]) or None,
+                        "user_agent": self._first_nonempty(payload_obj, ["user_agent", "userAgent"]) or None,
+                        "ip_address": self._first_nonempty(payload_obj, ["ip_address", "ipAddress", "ip"]) or None,
+                        "properties": raw_json,
+                        "payload": raw_json,
+                        "meta": meta_json,
+                    },
+                )
+                return True, int(getattr(result, "rowcount", 0) or 0)
+
+            if rk == "ui.add_to_cart":
+                session_id = self._first_nonempty(payload_obj, ["session_id", "sessionId"]) or None
+                page_url = self._first_nonempty(payload_obj, ["page_url", "pageUrl", "url", "path"]) or None
+                product_id = self._first_nonempty(payload_obj, ["product_id", "productId", "sku"]) or None
+                qty = self._first_int(payload_obj, ["quantity", "qty", "count"])
+                result = conn.execute(
+                    text(
+                        """
+                        INSERT INTO bronze.cart_events
+                            (event_id, event_timestamp, session_id, user_id, page_url, product_id, quantity, payload, meta)
+                        VALUES
+                            (:event_id, :event_timestamp, :session_id, :user_id, :page_url, :product_id, :quantity, :payload, :meta);
+                        """
+                    ),
+                    {
+                        "event_id": str(event.event_id),
+                        "event_timestamp": ts,
+                        "session_id": session_id,
+                        "user_id": event.user_id,
+                        "page_url": page_url,
+                        "product_id": product_id,
+                        "quantity": qty,
+                        "payload": raw_json,
+                        "meta": meta_json,
+                    },
+                )
+                return True, int(getattr(result, "rowcount", 0) or 0)
+
+            if rk == "ui.begin_checkout":
+                session_id = self._first_nonempty(payload_obj, ["session_id", "sessionId"]) or None
+                page_url = self._first_nonempty(payload_obj, ["page_url", "pageUrl", "url", "path"]) or None
+                order_id = self._first_nonempty(payload_obj, ["order_id", "orderId"]) or None
+                result = conn.execute(
+                    text(
+                        """
+                        INSERT INTO bronze.checkout_events
+                            (event_id, event_timestamp, session_id, user_id, page_url, order_id, payload, meta)
+                        VALUES
+                            (:event_id, :event_timestamp, :session_id, :user_id, :page_url, :order_id, :payload, :meta);
+                        """
+                    ),
+                    {
+                        "event_id": str(event.event_id),
+                        "event_timestamp": ts,
+                        "session_id": session_id,
+                        "user_id": event.user_id,
+                        "page_url": page_url,
+                        "order_id": order_id,
+                        "payload": raw_json,
+                        "meta": meta_json,
+                    },
+                )
+                return True, int(getattr(result, "rowcount", 0) or 0)
+
+            inserted_rows = 0
+
+            # Keep raw business events for downstream orders/payments/reviews ETL.
             result = conn.execute(
                 text(
                     """
@@ -239,7 +441,7 @@ class RabbitMQConsumer:
                 ),
                 {
                     "event_id": str(event.event_id),
-                    "event_timestamp": to_sqlserver_utc_naive(event.event_timestamp),
+                    "event_timestamp": ts,
                     "correlation_id": event.correlation_id,
                     "service": event.service,
                     "event_type": event.event_type,
@@ -248,7 +450,35 @@ class RabbitMQConsumer:
                     "payload": event.payload,
                 },
             )
-            return True, int(getattr(result, "rowcount", 0) or 0)
+            inserted_rows += int(getattr(result, "rowcount", 0) or 0)
+
+            if rk in {"order.paid", "payment.succeeded"}:
+                result2 = conn.execute(
+                    text(
+                        """
+                        INSERT INTO bronze.order_events
+                            (event_id, event_timestamp, session_id, user_id, order_id, payment_id, event_type, total_amount, currency, payload, meta)
+                        VALUES
+                            (:event_id, :event_timestamp, :session_id, :user_id, :order_id, :payment_id, :event_type, :total_amount, :currency, :payload, :meta);
+                        """
+                    ),
+                    {
+                        "event_id": str(event.event_id),
+                        "event_timestamp": ts,
+                        "session_id": None,
+                        "user_id": event.user_id,
+                        "order_id": self._first_nonempty(payload_obj, ["order_id", "orderId"]) or event.entity_id,
+                        "payment_id": self._first_nonempty(payload_obj, ["payment_id", "paymentId"]) or None,
+                        "event_type": rk,
+                        "total_amount": self._first_decimal(payload_obj, ["total_amount", "totalAmount", "amount"]),
+                        "currency": self._first_nonempty(payload_obj, ["currency", "currency_code", "currencyCode"]) or None,
+                        "payload": raw_json,
+                        "meta": meta_json,
+                    },
+                )
+                inserted_rows += int(getattr(result2, "rowcount", 0) or 0)
+
+            return True, inserted_rows
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=5), reraise=True)
     def _write_dead_letter_sync(

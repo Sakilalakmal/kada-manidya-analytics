@@ -6,7 +6,7 @@ services:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
     ports:
-      - "14331:1433"
+      - "${ANALYTICS_SQL_HOST_PORT:-15433}:1433"
     volumes:
       - analytics_sqlserver_data:/var/opt/mssql
     networks:
@@ -35,6 +35,10 @@ services:
     environment:
       # Connect to CORE RabbitMQ (from core compose)
       RABBITMQ_URL: "amqp://guest:guest@kada_rabbitmq:5672/"
+      RABBITMQ_EXCHANGE: "domain.events"
+      RABBITMQ_EXCHANGE_TYPE: "topic"
+      RABBITMQ_QUEUE: "analytics.business.events"
+      RABBITMQ_ROUTING_KEYS: "ui.page_view,ui.click,ui.add_to_cart,ui.begin_checkout,order.paid,payment.succeeded"
       ANALYTICS_CONSUMER_ENABLED: "yes"
       # Connect to ANALYTICS SQL Server (this compose)
       DB_HOST: "analytics_sqlserver"
@@ -69,7 +73,7 @@ services:
           sleep 2
         done
         python -m src.etl.01_create_warehouse
-        exec python -m src.jobs.runner --watch --interval-seconds 60 --no-seed
+        exec python -m src.jobs.runner --watch --interval-seconds 60 --window-days 30 --no-seed
     environment:
       DB_HOST: "analytics_sqlserver"
       DB_PORT: "1433"

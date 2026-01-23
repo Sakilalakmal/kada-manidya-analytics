@@ -247,7 +247,12 @@ def build_silver_web_events(conn) -> int:
                 pv.event_id AS source_event_id,
                 pv.event_timestamp,
                 CAST(pv.event_timestamp AS date) AS event_date,
-                pv.session_id,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(pv.session_id)), ''),
+                    JSON_VALUE(pv.properties, '$.session_id'),
+                    JSON_VALUE(pv.properties, '$.sessionId'),
+                    CONCAT('derived:', COALESCE(pv.user_id, 'anon'), ':', CONVERT(varchar(10), CAST(pv.event_timestamp AS date), 120))
+                ) AS session_id,
                 pv.user_id,
                 'page_view' AS event_type,
                 pv.page_url,
@@ -270,7 +275,12 @@ def build_silver_web_events(conn) -> int:
                 ce.event_id AS source_event_id,
                 ce.event_timestamp,
                 CAST(ce.event_timestamp AS date) AS event_date,
-                ce.session_id,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(ce.session_id)), ''),
+                    JSON_VALUE(ce.properties, '$.session_id'),
+                    JSON_VALUE(ce.properties, '$.sessionId'),
+                    CONCAT('derived:', COALESCE(ce.user_id, 'anon'), ':', CONVERT(varchar(10), CAST(ce.event_timestamp AS date), 120))
+                ) AS session_id,
                 ce.user_id,
                 CASE
                     WHEN ce.element_id = 'btn_add_to_cart' THEN 'add_to_cart'
@@ -298,10 +308,53 @@ def build_silver_web_events(conn) -> int:
             UNION ALL
 
             SELECT
+                c.event_id AS source_event_id,
+                c.event_timestamp,
+                CAST(c.event_timestamp AS date) AS event_date,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(c.session_id)), ''),
+                    CONCAT('derived:', COALESCE(c.user_id, 'anon'), ':', CONVERT(varchar(10), CAST(c.event_timestamp AS date), 120))
+                ) AS session_id,
+                c.user_id,
+                'add_to_cart' AS event_type,
+                COALESCE(c.page_url, '/') AS page_url,
+                c.product_id,
+                CAST('btn_add_to_cart' AS nvarchar(255)) AS element_id,
+                c.payload AS properties_json
+            FROM bronze.cart_events c
+            WHERE c.event_timestamp >= :since_ts
+
+            UNION ALL
+
+            SELECT
+                co.event_id AS source_event_id,
+                co.event_timestamp,
+                CAST(co.event_timestamp AS date) AS event_date,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(co.session_id)), ''),
+                    CONCAT('derived:', COALESCE(co.user_id, 'anon'), ':', CONVERT(varchar(10), CAST(co.event_timestamp AS date), 120))
+                ) AS session_id,
+                co.user_id,
+                'begin_checkout' AS event_type,
+                COALESCE(co.page_url, '/') AS page_url,
+                CAST(NULL AS nvarchar(64)) AS product_id,
+                CAST('btn_checkout' AS nvarchar(255)) AS element_id,
+                co.payload AS properties_json
+            FROM bronze.checkout_events co
+            WHERE co.event_timestamp >= :since_ts
+
+            UNION ALL
+
+            SELECT
                 se.event_id AS source_event_id,
                 se.event_timestamp,
                 CAST(se.event_timestamp AS date) AS event_date,
-                se.session_id,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(se.session_id)), ''),
+                    JSON_VALUE(se.properties, '$.session_id'),
+                    JSON_VALUE(se.properties, '$.sessionId'),
+                    CONCAT('derived:', COALESCE(se.user_id, 'anon'), ':', CONVERT(varchar(10), CAST(se.event_timestamp AS date), 120))
+                ) AS session_id,
                 se.user_id,
                 'scroll' AS event_type,
                 se.page_url,
@@ -317,7 +370,12 @@ def build_silver_web_events(conn) -> int:
                 sr.event_id AS source_event_id,
                 sr.event_timestamp,
                 CAST(sr.event_timestamp AS date) AS event_date,
-                sr.session_id,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(sr.session_id)), ''),
+                    JSON_VALUE(sr.properties, '$.session_id'),
+                    JSON_VALUE(sr.properties, '$.sessionId'),
+                    CONCAT('derived:', COALESCE(sr.user_id, 'anon'), ':', CONVERT(varchar(10), CAST(sr.event_timestamp AS date), 120))
+                ) AS session_id,
                 sr.user_id,
                 'search' AS event_type,
                 sr.page_url,
@@ -475,6 +533,340 @@ def build_silver_purchases(conn) -> int:
     return rc if rc > 0 else 0
 
 
+def _ensure_session_fact_tables(conn) -> None:
+    conn.execute(
+        text(
+            """
+            IF OBJECT_ID('silver.sessions', 'U') IS NULL
+            BEGIN
+                CREATE TABLE silver.sessions(
+                    session_id nvarchar(64) NOT NULL CONSTRAINT PK_silver_sessions PRIMARY KEY,
+                    user_id nvarchar(64) NULL,
+                    session_start datetime2 NOT NULL,
+                    session_end datetime2 NOT NULL,
+                    duration_seconds int NOT NULL,
+                    events_count int NOT NULL
+                );
+            END
+
+            IF OBJECT_ID('silver.session_events', 'U') IS NULL
+            BEGIN
+                CREATE TABLE silver.session_events(
+                    event_id uniqueidentifier NOT NULL
+                        CONSTRAINT DF_silver_session_events_event_id DEFAULT NEWID()
+                        CONSTRAINT PK_silver_session_events PRIMARY KEY,
+                    event_timestamp datetime2 NOT NULL,
+                    event_date date NOT NULL,
+                    session_id nvarchar(64) NOT NULL,
+                    user_id nvarchar(64) NULL,
+                    event_type nvarchar(64) NOT NULL,
+                    page_url nvarchar(2000) NULL,
+                    product_id nvarchar(64) NULL,
+                    element_id nvarchar(255) NULL,
+                    properties_json nvarchar(max) NULL
+                );
+            END
+
+            IF OBJECT_ID('silver.session_products', 'U') IS NULL
+            BEGIN
+                CREATE TABLE silver.session_products(
+                    session_id nvarchar(64) NOT NULL,
+                    product_id nvarchar(64) NOT NULL,
+                    first_seen datetime2 NOT NULL,
+                    last_seen datetime2 NOT NULL,
+                    views int NOT NULL,
+                    clicks int NOT NULL,
+                    add_to_cart int NOT NULL,
+                    begin_checkout int NOT NULL,
+                    purchases int NOT NULL,
+                    CONSTRAINT PK_silver_session_products PRIMARY KEY (session_id, product_id)
+                );
+            END
+            """
+        )
+    )
+
+
+def build_silver_session_facts(conn, *, days: int) -> int:
+    _ensure_session_fact_tables(conn)
+
+    since_ts = to_sqlserver_utc_naive(utc_now() - timedelta(days=max(1, int(days or 30))))
+
+    conn.execute(
+        text(
+            """
+            DELETE sp
+            FROM silver.session_products sp
+            INNER JOIN silver.sessions s ON sp.session_id = s.session_id
+            WHERE s.session_end >= :since_ts;
+            """
+        ),
+        {"since_ts": since_ts},
+    )
+    conn.execute(
+        text("DELETE FROM silver.session_events WHERE event_timestamp >= :since_ts;"),
+        {"since_ts": since_ts},
+    )
+    conn.execute(
+        text("DELETE FROM silver.sessions WHERE session_end >= :since_ts;"),
+        {"since_ts": since_ts},
+    )
+
+    # Sessionize web events (prefer explicit session_id; derive by time-window when missing)
+    res = conn.execute(
+        text(
+            """
+            ;WITH web_base AS (
+                SELECT
+                    we.event_timestamp,
+                    CAST(we.event_timestamp AS date) AS event_date,
+                    NULLIF(LTRIM(RTRIM(we.user_id)), '') AS user_id,
+                    NULLIF(LTRIM(RTRIM(we.session_id)), '') AS raw_session_id,
+                    we.event_type,
+                    we.page_url,
+                    NULLIF(LTRIM(RTRIM(we.product_id)), '') AS product_id,
+                    we.element_id,
+                    we.properties_json
+                FROM silver.web_events we
+                WHERE we.event_timestamp >= :since_ts
+            ),
+            web_norm AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN raw_session_id IS NULL THEN NULL
+                        WHEN raw_session_id LIKE 'derived:%' THEN NULL
+                        ELSE raw_session_id
+                    END AS provided_session_id
+                FROM web_base
+            ),
+            web_with_prev AS (
+                SELECT
+                    *,
+                    LAG(event_timestamp) OVER (PARTITION BY user_id ORDER BY event_timestamp) AS prev_ts
+                FROM web_norm
+            ),
+            web_flags AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN provided_session_id IS NOT NULL THEN 0
+                        WHEN user_id IS NULL THEN 0
+                        WHEN prev_ts IS NULL THEN 1
+                        WHEN DATEDIFF(minute, prev_ts, event_timestamp) > 30 THEN 1
+                        ELSE 0
+                    END AS new_session_flag
+                FROM web_with_prev
+            ),
+            web_groups AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN provided_session_id IS NOT NULL THEN 0
+                        WHEN user_id IS NULL THEN 0
+                        ELSE SUM(new_session_flag) OVER (
+                            PARTITION BY user_id
+                            ORDER BY event_timestamp
+                            ROWS UNBOUNDED PRECEDING
+                        )
+                    END AS session_group
+                FROM web_flags
+            ),
+            web_start AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN provided_session_id IS NOT NULL THEN MIN(event_timestamp) OVER (PARTITION BY provided_session_id)
+                        WHEN user_id IS NULL THEN MIN(event_timestamp) OVER (PARTITION BY page_url, event_date)
+                        ELSE MIN(event_timestamp) OVER (PARTITION BY user_id, session_group)
+                    END AS session_start_ts
+                FROM web_groups
+            ),
+            web_sessioned AS (
+                SELECT
+                    event_timestamp,
+                    event_date,
+                    COALESCE(
+                        provided_session_id,
+                        CASE
+                            WHEN user_id IS NULL THEN CONVERT(
+                                varchar(64),
+                                HASHBYTES('SHA2_256', CONCAT('anon|', COALESCE(page_url, ''), '|', CONVERT(varchar(10), event_date, 120))),
+                                2
+                            )
+                            ELSE CONVERT(
+                                varchar(64),
+                                HASHBYTES('SHA2_256', CONCAT('u:', user_id, '|', CONVERT(varchar(19), session_start_ts, 126), '|', CAST(session_group AS varchar(10)))),
+                                2
+                            )
+                        END
+                    ) AS session_id,
+                    user_id,
+                    event_type,
+                    page_url,
+                    product_id,
+                    element_id,
+                    properties_json
+                FROM web_start
+            ),
+            web_bounds AS (
+                SELECT
+                    session_id,
+                    user_id,
+                    MIN(event_timestamp) AS session_start,
+                    MAX(event_timestamp) AS session_end
+                FROM web_sessioned
+                GROUP BY session_id, user_id
+            ),
+            purchases_src AS (
+                SELECT
+                    p.event_timestamp,
+                    CAST(p.event_timestamp AS date) AS event_date,
+                    NULLIF(LTRIM(RTRIM(p.user_id)), '') AS user_id,
+                    p.order_id,
+                    p.total_amount,
+                    p.currency
+                FROM silver.purchases p
+                WHERE p.event_timestamp >= :since_ts
+            ),
+            purchase_sessioned AS (
+                SELECT
+                    p.event_timestamp,
+                    p.event_date,
+                    COALESCE(
+                        wb.session_id,
+                        CONVERT(
+                            varchar(64),
+                            HASHBYTES(
+                                'SHA2_256',
+                                CONCAT(
+                                    'purchase|u:',
+                                    COALESCE(p.user_id, 'anon'),
+                                    '|',
+                                    CONVERT(
+                                        varchar(19),
+                                        DATEADD(minute, (DATEDIFF(minute, 0, p.event_timestamp) / 30) * 30, 0),
+                                        126
+                                    )
+                                )
+                            ),
+                            2
+                        )
+                    ) AS session_id,
+                    p.user_id,
+                    'purchase' AS event_type,
+                    CAST(NULL AS nvarchar(2000)) AS page_url,
+                    CAST(NULL AS nvarchar(64)) AS product_id,
+                    CAST('purchase' AS nvarchar(255)) AS element_id,
+                    CONCAT(
+                        '{',
+                            '\"order_id\":', QUOTENAME(ISNULL(p.order_id, N''), '\"'),
+                            ',\"total_amount\":', COALESCE(CONVERT(varchar(50), p.total_amount), 'null'),
+                            ',\"currency\":', QUOTENAME(ISNULL(p.currency, N''), '\"'),
+                        '}'
+                    ) AS properties_json
+                FROM purchases_src p
+                OUTER APPLY (
+                    SELECT TOP 1 b.session_id
+                    FROM web_bounds b
+                    WHERE b.user_id = p.user_id
+                      AND p.event_timestamp >= DATEADD(minute, -15, b.session_start)
+                      AND p.event_timestamp <= DATEADD(minute, 30, b.session_end)
+                    ORDER BY b.session_end DESC
+                ) wb
+            ),
+            src AS (
+                SELECT * FROM web_sessioned
+                UNION ALL
+                SELECT
+                    event_timestamp,
+                    event_date,
+                    session_id,
+                    user_id,
+                    event_type,
+                    page_url,
+                    product_id,
+                    element_id,
+                    properties_json
+                FROM purchase_sessioned
+            ),
+            dedup AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            event_timestamp,
+                            session_id,
+                            event_type,
+                            ISNULL(page_url, ''),
+                            ISNULL(element_id, ''),
+                            ISNULL(product_id, '')
+                        ORDER BY event_timestamp
+                    ) AS rn
+                FROM src
+            )
+            INSERT INTO silver.session_events
+                (event_timestamp, event_date, session_id, user_id, event_type, page_url, product_id, element_id, properties_json)
+            SELECT
+                event_timestamp, event_date, session_id, user_id, event_type, page_url, product_id, element_id, properties_json
+            FROM dedup
+            WHERE rn = 1;
+            """
+        ),
+        {"since_ts": since_ts},
+    )
+    rows = int(getattr(res, "rowcount", 0) or 0)
+
+    conn.execute(
+        text(
+            """
+            INSERT INTO silver.sessions (session_id, user_id, session_start, session_end, duration_seconds, events_count)
+            SELECT
+                session_id,
+                MAX(user_id) AS user_id,
+                MIN(event_timestamp) AS session_start,
+                MAX(event_timestamp) AS session_end,
+                CASE
+                    WHEN DATEDIFF(second, MIN(event_timestamp), MAX(event_timestamp)) < 0 THEN 0
+                    ELSE DATEDIFF(second, MIN(event_timestamp), MAX(event_timestamp))
+                END AS duration_seconds,
+                COUNT(*) AS events_count
+            FROM silver.session_events
+            WHERE event_timestamp >= :since_ts
+            GROUP BY session_id;
+            """
+        ),
+        {"since_ts": since_ts},
+    )
+
+    conn.execute(
+        text(
+            """
+            INSERT INTO silver.session_products
+                (session_id, product_id, first_seen, last_seen, views, clicks, add_to_cart, begin_checkout, purchases)
+            SELECT
+                session_id,
+                product_id,
+                MIN(event_timestamp) AS first_seen,
+                MAX(event_timestamp) AS last_seen,
+                SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS views,
+                SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END) AS clicks,
+                SUM(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_cart,
+                SUM(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS begin_checkout,
+                SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) AS purchases
+            FROM silver.session_events
+            WHERE event_timestamp >= :since_ts
+              AND product_id IS NOT NULL
+              AND LTRIM(RTRIM(product_id)) <> ''
+            GROUP BY session_id, product_id;
+            """
+        ),
+        {"since_ts": since_ts},
+    )
+
+    return rows if rows > 0 else 0
+
+
 def main() -> int:
     args = _parse_args()
     settings = load_settings()
@@ -502,6 +894,7 @@ def main() -> int:
                             ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY event_timestamp) AS rn_asc,
                             ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY event_timestamp DESC) AS rn_desc
                         FROM bronze.page_view_events
+                        WHERE session_id IS NOT NULL AND LTRIM(RTRIM(session_id)) <> ''
                     ),
                     pv AS (
                         SELECT
@@ -525,6 +918,7 @@ def main() -> int:
                             MAX(event_timestamp) AS click_end_time,
                             COUNT(*) AS clicks
                         FROM bronze.click_events
+                        WHERE session_id IS NOT NULL AND LTRIM(RTRIM(session_id)) <> ''
                         GROUP BY session_id
                     ),
                     bounds AS (
@@ -604,7 +998,8 @@ def main() -> int:
                         ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY event_timestamp) AS step_number,
                         page_url,
                         event_timestamp
-                    FROM bronze.page_view_events;
+                    FROM bronze.page_view_events
+                    WHERE session_id IS NOT NULL AND LTRIM(RTRIM(session_id)) <> '';
                     """))
 
             conn.execute(
@@ -631,9 +1026,10 @@ def main() -> int:
                             ) AS product_id,
                             'view' AS interaction_type,
                             pv.properties
-                        FROM bronze.page_view_events pv
-                        WHERE pv.event_timestamp >= :since
-                          AND pv.page_url LIKE '/products/%'
+                    FROM bronze.page_view_events pv
+                    WHERE pv.event_timestamp >= :since
+                      AND pv.page_url LIKE '/products/%'
+                      AND pv.session_id IS NOT NULL AND LTRIM(RTRIM(pv.session_id)) <> ''
                     ),
                     clicks AS (
                         SELECT
@@ -654,9 +1050,10 @@ def main() -> int:
                                 ELSE 'click'
                             END AS interaction_type,
                             ce.properties
-                        FROM bronze.click_events ce
-                        WHERE ce.event_timestamp >= :since
-                          AND ce.page_url LIKE '/products/%'
+                    FROM bronze.click_events ce
+                    WHERE ce.event_timestamp >= :since
+                      AND ce.page_url LIKE '/products/%'
+                      AND ce.session_id IS NOT NULL AND LTRIM(RTRIM(ce.session_id)) <> ''
                     ),
                     src AS (
                         SELECT event_timestamp, session_id, user_id, product_id, interaction_type, properties FROM views
@@ -1098,11 +1495,15 @@ def main() -> int:
             rows_inserted += int(getattr(res, "rowcount", 0) or 0)
 
             purchase_rows_inserted = build_silver_purchases(conn)
+            session_rows_inserted = build_silver_session_facts(conn, days=args.days)
 
             finish_run(
                 conn,
                 run,
-                rows_inserted=int(rows_inserted) + int(web_rows_inserted) + int(purchase_rows_inserted),
+                rows_inserted=int(rows_inserted)
+                + int(web_rows_inserted)
+                + int(purchase_rows_inserted)
+                + int(session_rows_inserted),
             )
         except Exception as exc:
             fail_run(conn, run, str(exc))

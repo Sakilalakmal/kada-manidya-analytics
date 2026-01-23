@@ -51,6 +51,19 @@ def _ensure_behavior_gold_tables(conn) -> None:
                     view_to_purchase_rate float NOT NULL
                 );
             END
+
+            IF OBJECT_ID('gold.product_daily', 'U') IS NULL
+            BEGIN
+                CREATE TABLE gold.product_daily(
+                    product_id varchar(64) NOT NULL,
+                    metric_date date NOT NULL,
+                    purchases_count int NOT NULL,
+                    revenue decimal(12,2) NOT NULL,
+                    avg_rating decimal(5,2) NULL,
+                    reviews_count int NOT NULL,
+                    CONSTRAINT PK_gold_product_daily PRIMARY KEY (product_id, metric_date)
+                );
+            END
             """
         )
     )
@@ -284,19 +297,7 @@ def main() -> int:
                 conn.execute(
                     text(
                         """
-                        ;WITH seed_orders AS (
-                            SELECT DISTINCT
-                                COALESCE(
-                                    be.entity_id,
-                                    JSON_VALUE(be.payload, '$.order_id'),
-                                    JSON_VALUE(be.payload, '$.data.order_id'),
-                                    JSON_VALUE(be.payload, '$.order.order_id')
-                                ) AS order_id
-                            FROM bronze.business_events be
-                            WHERE be.event_timestamp >= :since_date
-                              AND be.payload LIKE '%seed_run_id%'
-                        ),
-                        we AS (
+                        ;WITH se AS (
                             SELECT
                                 CAST(event_timestamp AS date) AS metric_date,
                                 COUNT(DISTINCT session_id) AS sessions,
@@ -304,46 +305,18 @@ def main() -> int:
                                 SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS page_views,
                                 SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END) AS clicks,
                                 SUM(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_cart,
-                                SUM(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS begin_checkout
-                            FROM silver.web_events
+                                SUM(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS begin_checkout,
+                                SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) AS purchases
+                            FROM silver.session_events
                             WHERE event_timestamp >= :since_date
                               AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
                             GROUP BY CAST(event_timestamp AS date)
-                        ),
-                        p AS (
-                            SELECT
-                                CAST(event_timestamp AS date) AS metric_date,
-                                COUNT(
-                                    DISTINCT COALESCE(
-                                        CONCAT('o:', JSON_VALUE(properties_json, '$.order_id')),
-                                        CONCAT('s:', session_id)
-                                    )
-                                ) AS purchases
-                            FROM silver.web_events
-                            WHERE event_timestamp >= :since_date
-                              AND event_type = 'purchase'
-                              AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
-                            GROUP BY CAST(event_timestamp AS date)
-                        ),
-                        merged AS (
-                            SELECT
-                                COALESCE(we.metric_date, p.metric_date) AS metric_date,
-                                ISNULL(we.sessions, 0) AS sessions,
-                                ISNULL(we.unique_users, 0) AS unique_users,
-                                ISNULL(we.page_views, 0) AS page_views,
-                                ISNULL(we.clicks, 0) AS clicks,
-                                ISNULL(we.add_to_cart, 0) AS add_to_cart,
-                                ISNULL(we.begin_checkout, 0) AS begin_checkout,
-                                ISNULL(p.purchases, 0) AS purchases
-                            FROM we
-                            FULL OUTER JOIN p
-                                ON we.metric_date = p.metric_date
                         )
                         INSERT INTO gold.behavior_daily
                             (metric_date, sessions, unique_users, page_views, clicks, add_to_cart, begin_checkout, purchases)
                         SELECT
                             metric_date, sessions, unique_users, page_views, clicks, add_to_cart, begin_checkout, purchases
-                        FROM merged
+                        FROM se
                         WHERE metric_date >= :since_date;
                         """
                     ),
@@ -365,11 +338,11 @@ def main() -> int:
                             SELECT
                                 CAST(event_timestamp AS date) AS metric_date,
                                 session_id,
-                                MAX(CASE WHEN event_type = 'page_view' AND product_id IS NOT NULL THEN 1 ELSE 0 END) AS has_view,
+                                MAX(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS has_view,
                                 MAX(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS has_cart,
                                 MAX(CASE WHEN event_type = 'begin_checkout' THEN 1 ELSE 0 END) AS has_checkout,
                                 MAX(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) AS has_purchase
-                            FROM silver.web_events
+                            FROM silver.session_events
                             WHERE event_timestamp >= :since_date
                               AND (:show_seed_data = 1 OR COALESCE(properties_json, '') NOT LIKE '%seed_run_id%')
                             GROUP BY CAST(event_timestamp AS date), session_id
@@ -404,6 +377,98 @@ def main() -> int:
                             metric_date, view_sessions, cart_sessions, checkout_sessions, purchase_sessions,
                             view_to_cart_rate, cart_to_checkout_rate, checkout_to_purchase_rate, view_to_purchase_rate
                         FROM with_rates
+                        WHERE metric_date >= :since_date;
+                        """
+                    ),
+                    {"since_date": since_date, "show_seed_data": 1 if show_seed_data else 0},
+                )
+            )
+
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text("DELETE FROM gold.product_daily WHERE metric_date >= :since_date;"),
+                    {"since_date": since_date},
+                )
+            )
+            rows_inserted += _safe_rowcount(
+                conn.execute(
+                    text(
+                        """
+                        ;WITH seed_orders AS (
+                            SELECT DISTINCT
+                                COALESCE(
+                                    be.entity_id,
+                                    JSON_VALUE(be.payload, '$.order_id'),
+                                    JSON_VALUE(be.payload, '$.data.order_id'),
+                                    JSON_VALUE(be.payload, '$.order.order_id')
+                                ) AS order_id
+                            FROM bronze.business_events be
+                            WHERE be.event_timestamp >= :since_date
+                              AND be.payload LIKE '%seed_run_id%'
+                        ),
+                        paid AS (
+                            SELECT
+                                o.order_id,
+                                o.updated_at
+                            FROM silver.orders o
+                            WHERE o.updated_at >= :since_date
+                              AND o.status = 'paid'
+                              AND (:show_seed_data = 1 OR NOT EXISTS (
+                                  SELECT 1 FROM seed_orders so WHERE so.order_id = o.order_id
+                              ))
+                        ),
+                        item_sales AS (
+                            SELECT
+                                CAST(p.updated_at AS date) AS metric_date,
+                                oi.product_id,
+                                SUM(COALESCE(oi.quantity, 0)) AS purchases_count,
+                                SUM(COALESCE(oi.line_total, oi.unit_price * oi.quantity, 0)) AS revenue
+                            FROM paid p
+                            INNER JOIN silver.order_items oi ON oi.order_id = p.order_id
+                            GROUP BY CAST(p.updated_at AS date), oi.product_id
+                        ),
+                        reviews AS (
+                            SELECT
+                                CAST(created_at AS date) AS metric_date,
+                                product_id,
+                                AVG(CAST(rating AS decimal(5,2))) AS avg_rating,
+                                COUNT(*) AS reviews_count
+                            FROM silver.reviews
+                            WHERE created_at >= :since_date
+                            GROUP BY CAST(created_at AS date), product_id
+                        ),
+                        seen_products AS (
+                            SELECT DISTINCT
+                                CAST(first_seen AS date) AS metric_date,
+                                product_id
+                            FROM silver.session_products
+                            WHERE first_seen >= :since_date
+                        ),
+                        keys AS (
+                            SELECT metric_date, product_id FROM seen_products
+                            UNION
+                            SELECT metric_date, product_id FROM item_sales
+                            UNION
+                            SELECT metric_date, product_id FROM reviews
+                        ),
+                        merged AS (
+                            SELECT
+                                k.product_id,
+                                k.metric_date,
+                                ISNULL(s.purchases_count, 0) AS purchases_count,
+                                ISNULL(s.revenue, 0) AS revenue,
+                                r.avg_rating,
+                                ISNULL(r.reviews_count, 0) AS reviews_count
+                            FROM keys k
+                            LEFT JOIN item_sales s
+                                ON k.metric_date = s.metric_date AND k.product_id = s.product_id
+                            LEFT JOIN reviews r
+                                ON k.metric_date = r.metric_date AND k.product_id = r.product_id
+                            WHERE k.product_id IS NOT NULL AND LTRIM(RTRIM(k.product_id)) <> ''
+                        )
+                        INSERT INTO gold.product_daily (product_id, metric_date, purchases_count, revenue, avg_rating, reviews_count)
+                        SELECT product_id, metric_date, purchases_count, revenue, avg_rating, reviews_count
+                        FROM merged
                         WHERE metric_date >= :since_date;
                         """
                     ),
