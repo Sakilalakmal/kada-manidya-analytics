@@ -3,9 +3,19 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from src.models.events import BusinessEvent
 from src.utils.time import utc_now
+
+
+def _parse_uuid(value: Any) -> UUID | None:
+    if value is None:
+        return None
+    try:
+        return UUID(str(value).strip())
+    except Exception:
+        return None
 
 
 def _iso_to_utc(value: str) -> datetime | None:
@@ -119,6 +129,17 @@ def _best_effort_event_type(payload: Any, routing_key: str) -> str:
     return (et or routing_key or "unknown")[:100]
 
 
+def _best_effort_event_id(payload: Any, message_id: str | None) -> UUID | None:
+    if message_id:
+        mid = _parse_uuid(message_id)
+        if mid is not None:
+            return mid
+
+    dcts = _candidate_dicts(payload)
+    event_id = _first_nonempty_str(dcts, ["event_id", "eventId", "id", "eventID"])
+    return _parse_uuid(event_id)
+
+
 def _best_effort_correlation_id(payload: Any, message_correlation_id: str | None) -> str | None:
     if message_correlation_id:
         s = str(message_correlation_id).strip()
@@ -200,6 +221,7 @@ def normalize_to_business_event(
     inferred = _infer_service_from_key(event_type, routing_key)
     if (not service) or service == "unknown":
         service = inferred or "unknown"
+    event_id = _best_effort_event_id(payload_obj, message_id)
     correlation_id = _best_effort_correlation_id(payload_obj, message_correlation_id)
     user_id = _best_effort_user_id(payload_obj)
     entity_id = _best_effort_entity_id(payload_obj)
@@ -207,21 +229,23 @@ def normalize_to_business_event(
 
     session_id = correlation_id or session_fallback
 
-    return BusinessEvent.model_validate(
-        {
-            "event_type": event_type,
-            "event_timestamp": event_timestamp,
-            "session_id": session_id,
-            "source": "service",
-            "service": service,
-            "correlation_id": correlation_id,
-            "user_id": user_id,
-            "entity_id": entity_id,
-            "payload": raw_json,
-            "_meta": {
-                "routing_key": routing_key,
-                "message_id": message_id,
-            },
-        }
-    )
+    data: dict[str, Any] = {
+        "event_type": event_type,
+        "event_timestamp": event_timestamp,
+        "session_id": session_id,
+        "source": "service",
+        "service": service,
+        "correlation_id": correlation_id,
+        "user_id": user_id,
+        "entity_id": entity_id,
+        "payload": raw_json,
+        "_meta": {
+            "routing_key": routing_key,
+            "message_id": message_id,
+        },
+    }
+    if event_id is not None:
+        data["event_id"] = event_id
+        data["_meta"]["event_id_source"] = "message_id" if message_id else "payload"
+    return BusinessEvent.model_validate(data)
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 
 from loguru import logger
+import uvicorn
 
 from src.config import load_settings
 from src.consumers.rabbitmq_consumer import RabbitMQConsumer
@@ -27,6 +29,31 @@ def _install_signal_handlers(stop_event: asyncio.Event) -> None:
         pass
 
 
+async def _serve_health(stop_event: asyncio.Event) -> None:
+    enabled = (os.getenv("CONSUMER_HEALTH_ENABLED", "yes") or "").strip().lower()
+    if enabled not in {"1", "true", "yes", "y", "on"}:
+        return
+
+    host = os.getenv("CONSUMER_HEALTH_HOST", "0.0.0.0")
+    port = int(os.getenv("CONSUMER_HEALTH_PORT", "9100"))
+
+    config = uvicorn.Config(
+        "src.consumers.health_api:app",
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
+
+    try:
+        await stop_event.wait()
+    finally:
+        server.should_exit = True
+        await task
+
+
 async def _amain() -> int:
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -42,7 +69,12 @@ async def _amain() -> int:
     _install_signal_handlers(stop_event)
 
     consumer = RabbitMQConsumer.from_env()
-    await consumer.run(stop_event)
+    health_task = asyncio.create_task(_serve_health(stop_event))
+    try:
+        await consumer.run(stop_event)
+    finally:
+        stop_event.set()
+        await health_task
     return 0
 
 

@@ -89,43 +89,48 @@ def _fmt_pct(value) -> str:
 def executive():
     st.header("Executive")
 
+    as_of = _latest_date("gold.orders_payments_daily", "metric_date")
+    if not as_of:
+        st.info("No data yet.")
+        return
+
     kpis = _safe_df(
         """
         SELECT
-            CAST(SYSUTCDATETIME() AS date) AS metric_date,
+            CAST(:d AS date) AS metric_date,
             COUNT(1) AS rows_count,
-            SUM(CAST(total_revenue AS float)) AS total_revenue,
-            SUM(CAST(total_orders AS float)) AS total_orders,
-            SUM(CAST(cancelled_orders AS float)) AS cancelled_orders,
+            COALESCE(SUM(CAST(total_revenue AS float)), 0) AS total_revenue,
+            COALESCE(SUM(CAST(total_orders AS float)), 0) AS total_orders,
+            COALESCE(SUM(CAST(cancelled_orders AS float)), 0) AS cancelled_orders,
             CASE
-                WHEN SUM(CAST(total_orders AS float)) = 0 THEN NULL
-                ELSE SUM(CAST(cancelled_orders AS float)) / NULLIF(SUM(CAST(total_orders AS float)), 0)
+                WHEN COALESCE(SUM(CAST(total_orders AS float)), 0) = 0 THEN 0
+                ELSE COALESCE(SUM(CAST(cancelled_orders AS float)), 0) / NULLIF(COALESCE(SUM(CAST(total_orders AS float)), 0), 0)
             END AS cancel_rate,
             CASE
                 WHEN COUNT(payment_success_rate) = 0 THEN NULL
-                ELSE AVG(CAST(payment_success_rate AS float))
+                ELSE COALESCE(AVG(CAST(payment_success_rate AS float)), 0)
             END AS payment_success_rate
         FROM gold.orders_payments_daily
-        WHERE CAST(metric_date AS date) = CAST(SYSUTCDATETIME() AS date);
-        """
+        WHERE CAST(metric_date AS date) = CAST(:d AS date);
+        """,
+        {"d": as_of},
     )
 
     if kpis.empty:
-        st.warning("No gold.orders_payments_daily data yet. Run the ETL first.")
+        st.info("No data yet.")
         return
 
     r = kpis.iloc[0].to_dict()
     rows_count = int(r.get("rows_count") or 0)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Revenue Today", _fmt_lkr(r.get("total_revenue")))
-    c2.metric("Orders Today", _fmt_int(r.get("total_orders")))
+    for c in (c1, c2, c3, c4):
+        c.caption(f"As of {as_of}")
+    c1.metric("Revenue", _fmt_lkr(r.get("total_revenue")))
+    c2.metric("Orders", _fmt_int(r.get("total_orders")))
     c3.metric("Cancel Rate", _fmt_pct(r.get("cancel_rate")))
     c4.metric("Payment Success Rate", _fmt_pct(r.get("payment_success_rate")))
     if rows_count == 0:
-        st.info("No data available yet.")
-        latest = _latest_date("gold.orders_payments_daily", "metric_date")
-        if latest:
-            st.caption(f"Latest available date: {latest}")
+        st.info("No data yet.")
 
     trend = _safe_df(
         """
@@ -133,17 +138,15 @@ def executive():
             CAST(metric_date AS date) AS metric_date,
             SUM(CAST(total_revenue AS float)) AS total_revenue
         FROM gold.orders_payments_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(SYSUTCDATETIME() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(:d AS date))
         GROUP BY CAST(metric_date AS date)
         ORDER BY metric_date DESC;
-        """
+        """,
+        {"d": as_of},
     )
     st.subheader("Revenue Trend (Last 14 Days)")
     if trend.empty:
         st.info("No data available yet.")
-        latest = _latest_date("gold.orders_payments_daily", "metric_date")
-        if latest:
-            st.caption(f"Latest available date: {latest}")
         return
     trend = trend.sort_values("metric_date")
     trend["metric_date"] = pd.to_datetime(trend["metric_date"])
@@ -196,7 +199,11 @@ def executive():
 
 def product():
     st.header("Product")
-    st.caption("Top products are computed from the last 30 days of gold metrics.")
+    as_of = _latest_date("gold.product_daily", "metric_date")
+    if not as_of:
+        st.info("No data yet.")
+        return
+    st.caption(f"As of {as_of} (last 30 days window)")
 
     top_rev = _safe_df(
         """
@@ -204,10 +211,11 @@ def product():
             product_id,
             SUM(CAST(revenue AS float)) AS revenue
         FROM gold.product_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(:d AS date))
         GROUP BY product_id
         ORDER BY revenue DESC;
-        """
+        """,
+        {"d": as_of},
     )
     top_purchases = _safe_df(
         """
@@ -215,10 +223,11 @@ def product():
             product_id,
             SUM(CAST(purchases_count AS float)) AS purchases_count
         FROM gold.product_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(:d AS date))
         GROUP BY product_id
         ORDER BY purchases_count DESC;
-        """
+        """,
+        {"d": as_of},
     )
 
     c1, c2 = st.columns(2)
@@ -226,9 +235,6 @@ def product():
         st.subheader("Top 5 Products by Revenue (30d)")
         if top_rev.empty:
             st.info("No data available yet.")
-            latest = _latest_date("gold.product_daily", "metric_date")
-            if latest:
-                st.caption(f"Latest available date: {latest}")
         else:
             top_rev_display = top_rev.copy()
             top_rev_display["revenue"] = top_rev_display["revenue"].map(_fmt_lkr)
@@ -239,9 +245,6 @@ def product():
         st.subheader("Top 5 Products by Purchases (30d)")
         if top_purchases.empty:
             st.info("No data available yet.")
-            latest = _latest_date("gold.product_daily", "metric_date")
-            if latest:
-                st.caption(f"Latest available date: {latest}")
         else:
             top_purchases_display = top_purchases.copy()
             top_purchases_display["purchases_count"] = top_purchases_display[
@@ -264,16 +267,14 @@ def product():
             END AS avg_rating_30d,
             SUM(CAST(reviews_count AS int)) AS total_reviews_30d
         FROM gold.product_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(SYSUTCDATETIME() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -29, CAST(:d AS date))
         GROUP BY product_id
         ORDER BY total_reviews_30d DESC;
-        """
+        """,
+        {"d": as_of},
     )
     if reviews.empty:
         st.info("No data available yet.")
-        latest = _latest_date("gold.product_daily", "metric_date")
-        if latest:
-            st.caption(f"Latest available date: {latest}")
     else:
         reviews_display = reviews.copy()
         reviews_display["avg_rating_30d"] = reviews_display["avg_rating_30d"].map(
@@ -388,6 +389,10 @@ def ops():
         )
 
     st.subheader("System Health (If Available)")
+    as_of = _latest_date("gold.system_health_daily", "metric_date")
+    if not as_of:
+        st.caption("gold.system_health_daily not available (or empty).")
+        return
     health = _safe_df(
         """
         SELECT TOP 14
@@ -395,16 +400,17 @@ def ops():
             AVG(CAST(p95_latency_ms AS float)) AS p95_latency_ms,
             AVG(CAST(error_rate AS float)) AS error_rate
         FROM gold.system_health_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(SYSUTCDATETIME() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -13, CAST(:d AS date))
         GROUP BY CAST(metric_date AS date)
         ORDER BY metric_date DESC;
-        """
-        ,
+        """,
+        {"d": as_of},
         show_error=False,
     )
     if health.empty:
         st.caption("gold.system_health_daily not available (or empty).")
     else:
+        st.caption(f"As of {as_of}")
         health = health.sort_values("metric_date")
         health["metric_date"] = pd.to_datetime(health["metric_date"])
         c1, c2 = st.columns(2)
@@ -420,6 +426,11 @@ def behavior():
     st.header("Behavior")
     window_days = st.selectbox("Window", [14, 30], index=0)
 
+    as_of = _latest_date("gold.behavior_daily", "metric_date")
+    if not as_of:
+        st.info("No data yet.")
+        return
+
     today = _safe_df(
         """
         SELECT TOP 1
@@ -429,8 +440,9 @@ def behavior():
             add_to_cart,
             purchases
         FROM gold.behavior_daily
-        WHERE CAST(metric_date AS date) = CAST(SYSUTCDATETIME() AS date);
+        WHERE CAST(metric_date AS date) = CAST(:d AS date);
         """,
+        {"d": as_of},
         show_error=False,
     )
     funnel_today = _safe_df(
@@ -443,10 +455,32 @@ def behavior():
             purchase_sessions,
             view_to_purchase_rate
         FROM gold.funnel_daily
-        WHERE CAST(metric_date AS date) = CAST(SYSUTCDATETIME() AS date);
+        WHERE CAST(metric_date AS date) = CAST(:d AS date);
         """,
+        {"d": as_of},
         show_error=False,
     )
+
+    funnel_caption: str | None = None
+    if funnel_today.empty:
+        funnel_as_of = _latest_date("gold.funnel_daily", "metric_date")
+        if funnel_as_of:
+            funnel_today = _safe_df(
+                """
+                SELECT TOP 1
+                    CAST(metric_date AS date) AS metric_date,
+                    view_sessions,
+                    cart_sessions,
+                    checkout_sessions,
+                    purchase_sessions,
+                    view_to_purchase_rate
+                FROM gold.funnel_daily
+                WHERE CAST(metric_date AS date) = CAST(:d AS date);
+                """,
+                {"d": funnel_as_of},
+                show_error=False,
+            )
+            funnel_caption = f"Funnel as of {funnel_as_of}"
 
     sessions = 0 if today.empty else int(today.loc[0, "sessions"] or 0)
     page_views = 0 if today.empty else int(today.loc[0, "page_views"] or 0)
@@ -455,11 +489,18 @@ def behavior():
     view_to_purchase = None if funnel_today.empty else funnel_today.loc[0, "view_to_purchase_rate"]
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Sessions Today", _fmt_int(sessions))
-    c2.metric("Page Views Today", _fmt_int(page_views))
-    c3.metric("Add-to-cart Today", _fmt_int(add_to_cart))
-    c4.metric("Purchases Today", _fmt_int(purchases))
-    c5.metric("View->Purchase %", _fmt_pct(view_to_purchase))
+    for c in (c1, c2, c3, c4, c5):
+        c.caption(f"As of {as_of}")
+    c1.metric("Sessions", _fmt_int(sessions))
+    c2.metric("Page Views", _fmt_int(page_views))
+    c3.metric("Add-to-cart", _fmt_int(add_to_cart))
+    c4.metric("Purchases", _fmt_int(purchases))
+    c5.metric("View->Purchase %", "No data yet" if funnel_today.empty else _fmt_pct(view_to_purchase))
+
+    if funnel_today.empty:
+        st.caption("No funnel data yet.")
+    elif funnel_caption:
+        st.caption(funnel_caption)
 
     series = _safe_df(
         f"""
@@ -469,9 +510,10 @@ def behavior():
             page_views,
             purchases
         FROM gold.behavior_daily
-        WHERE CAST(metric_date AS date) >= DATEADD(day, -{int(window_days) - 1}, CAST(SYSUTCDATETIME() AS date))
+        WHERE CAST(metric_date AS date) >= DATEADD(day, -{int(window_days) - 1}, CAST(:d AS date))
         ORDER BY metric_date DESC;
         """,
+        {"d": as_of},
         show_error=False,
     )
     st.subheader(f"Last {window_days} Days")
