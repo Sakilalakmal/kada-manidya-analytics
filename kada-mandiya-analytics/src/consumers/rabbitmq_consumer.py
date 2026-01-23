@@ -14,7 +14,12 @@ from sqlalchemy import text
 from src.config import load_settings
 from src.consumers.idempotency import compute_fingerprint
 from src.consumers.mapper import decode_json_message, normalize_to_business_event
-from src.consumers.ops import ensure_ops_tables, write_dead_letter, claim_fingerprint_or_skip
+from src.consumers.ops import (
+    ensure_ops_tables,
+    write_dead_letter,
+    claim_event_id_or_skip,
+    claim_fingerprint_or_skip,
+)
 from src.db.engine import get_engine
 from src.utils.time import to_sqlserver_utc_naive, utc_now
 
@@ -244,6 +249,13 @@ class RabbitMQConsumer:
             )
             return "reject" if self._cfg.dlq else "ack"
 
+        logger.info(
+            "consumed rk='{}' event_type='{}' event_id='{}'",
+            routing_key,
+            event.event_type,
+            str(getattr(event, "event_id", "")),
+        )
+
         try:
             inserted, rowcount = await asyncio.to_thread(
                 self._insert_event_sync,
@@ -274,7 +286,12 @@ class RabbitMQConsumer:
                 rowcount,
             )
         else:
-            logger.debug("duplicate rk='{}' fp='{}' (skipped)", routing_key, fp[:12])
+            logger.debug(
+                "duplicate rk='{}' event_id='{}' fp='{}' (skipped)",
+                routing_key,
+                str(getattr(event, "event_id", "")),
+                fp[:12],
+            )
         return "ack"
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=0.5, min=0.5, max=10), reraise=True)
@@ -297,6 +314,17 @@ class RabbitMQConsumer:
                 source="rabbitmq",
             )
             if not claimed:
+                return False, 0
+
+            claimed_event = claim_event_id_or_skip(
+                conn,
+                event_id=str(event.event_id),
+                first_seen_at=first_seen_at,
+                routing_key=routing_key,
+                message_id=message_id,
+                source="rabbitmq",
+            )
+            if not claimed_event:
                 return False, 0
 
             rk = (routing_key or "").strip().lower()

@@ -33,7 +33,7 @@ class Settings(BaseModel):
         default="analytics.business.events", alias="RABBITMQ_QUEUE"
     )
     rabbitmq_routing_keys: str = Field(
-        default="ui.page_view,ui.click,ui.add_to_cart,ui.begin_checkout,order.paid,payment.succeeded,review.*",
+        default="ui.page_view,ui.click,ui.add_to_cart,ui.begin_checkout,order.created,order.paid,payment.succeeded,review.*",
         alias="RABBITMQ_ROUTING_KEYS",
     )
     rabbitmq_prefetch: int = Field(default=50, alias="RABBITMQ_PREFETCH")
